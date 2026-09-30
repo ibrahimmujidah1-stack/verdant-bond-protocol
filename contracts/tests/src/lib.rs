@@ -652,7 +652,7 @@ mod integration {
                 &1,
             );
 
-            contracts.oc_client.verify_report(&admin, &report_id, &2);
+            verify_with_quorum(&env, &contracts.oc_client, &admin, report_id, 2);
             assert_eq!(
                 contracts.oc_client.get_report(&report_id).status,
                 ReportStatus::Verified
@@ -683,11 +683,11 @@ mod integration {
             let blocked = contracts
                 .ce_client
                 .try_distribute_coupon(&admin, &bond_id, &1, &holders, &report_id, &2);
-            assert_eq!(blocked, Err(Ok(BondError::ReportNotVerified)));
+            assert_eq!(blocked, Err(Ok(BondError::ProjectDisputedAndFrozen)));
 
             contracts
                 .oc_client
-                .resolve_challenge(&admin, &report_id, &ReportStatus::Verified, &3);
+                .resolve_challenge(&admin, &report_id, &ReportStatus::Verified, &4);
             assert_eq!(
                 contracts.oc_client.get_report(&report_id).status,
                 ReportStatus::Verified
@@ -1971,6 +1971,60 @@ mod integration {
             content.push('\n');
             std::fs::write(&fixture_path(), content).expect("write storage_keys.json");
             eprintln!("wrote {}", fixture_path().display());
+        }
+    }
+
+    // Issue #188: versioned-interface convention — every contract in the
+    // suite publishes its schema version so callers can gate interoperation.
+    mod schema_versions {
+        use super::*;
+        use nbbs_shared::CURRENT_SCHEMA_VERSION;
+
+        #[test]
+        fn all_contracts_publish_the_current_schema_version() {
+            let env = Env::default();
+            let admin = Address::generate(&env);
+
+            let issuer_id = env.register(BondIssuer, (admin.clone(),));
+            let registry_id = env.register(ProjectRegistry, (admin.clone(),));
+            let oracle_id = env.register(OracleConsumer, (admin.clone(),));
+            let coupon_id = env.register(
+                CouponEngine,
+                (admin.clone(), issuer_id.clone(), oracle_id.clone()),
+            );
+            let retirement_id = env.register(
+                CreditRetirement,
+                (admin.clone(), issuer_id.clone(), coupon_id.clone()),
+            );
+            let dex_id = env.register(
+                DEXRouter,
+                (admin.clone(), issuer_id.clone(), coupon_id.clone()),
+            );
+
+            assert_eq!(
+                CouponEngineClient::new(&env, &coupon_id).schema_version(),
+                CURRENT_SCHEMA_VERSION
+            );
+            assert_eq!(
+                BondIssuerClient::new(&env, &issuer_id).schema_version(),
+                CURRENT_SCHEMA_VERSION
+            );
+            assert_eq!(
+                ProjectRegistryClient::new(&env, &registry_id).schema_version(),
+                CURRENT_SCHEMA_VERSION
+            );
+            assert_eq!(
+                OracleConsumerClient::new(&env, &oracle_id).schema_version(),
+                CURRENT_SCHEMA_VERSION
+            );
+            assert_eq!(
+                CreditRetirementClient::new(&env, &retirement_id).schema_version(),
+                CURRENT_SCHEMA_VERSION
+            );
+            assert_eq!(
+                DEXRouterClient::new(&env, &dex_id).schema_version(),
+                CURRENT_SCHEMA_VERSION
+            );
         }
     }
 }

@@ -9,11 +9,27 @@ import { HolderIndexService } from '../bonds/holder-index.service';
 import { IntentService } from './services/intent.service';
 import { IntentGuard } from './guards/intent.guard';
 import { IdempotencyService } from './services/idempotency.service';
+import { SearchIndexService } from './search/search-index.service';
+import { EnvConfigValidator } from './config/env-config.validator';
+import { TelemetryService } from './services/telemetry.service';
+import { TelemetryInterceptor } from './interceptors/telemetry.interceptor';
+import { QuotaService } from './services/quota.service';
+import { QuotaGuard } from './guards/quota.guard';
+import { StellarModule } from '../stellar/stellar.module';
+import { QuotaController } from './quota.controller';
+
+const SHARED = [
+  NonceService, RedisService, SigningKeyProvider, ConfigService, KycStoreService,
+  HolderIndexService, IntentService, IntentGuard, IdempotencyService,
+  SearchIndexService, EnvConfigValidator,
+  TelemetryService, TelemetryInterceptor, QuotaService, QuotaGuard,
+];
 
 @Global()
 @Module({
-  controllers: [RedisHealthController],
-  providers: [NonceService, RedisService, SigningKeyProvider, ConfigService, KycStoreService, HolderIndexService, IntentService, IntentGuard, IdempotencyService],
-  exports: [NonceService, RedisService, SigningKeyProvider, ConfigService, KycStoreService, HolderIndexService, IntentService, IntentGuard, IdempotencyService],
+  imports: [StellarModule],
+  controllers: [RedisHealthController, QuotaController],
+  providers: SHARED,
+  exports: SHARED,
 })
 export class CommonModule {}

@@ -17,6 +17,17 @@ pub enum BondError {
     InvalidSupply = 12,
     RedemptionUnderfunded = 13,
     IncompatibleMethodologyCreditType = 14,
+    /// A report's performance change is outside the documented bounds; coupon
+    /// distribution is paused pending dispute resolution (#186).
+    PerformanceFlagged = 15,
+    /// Fewer independent verifiers than the coupon-level minimum (#186).
+    InsufficientAttestations = 16,
+    /// Coupon writes are paused while a migration window is open (#188).
+    MigrationInProgress = 17,
+    /// Oracle feed is stale beyond threshold 2 requiring manual intervention (#192).
+    OracleStaleManualInterventionRequired = 18,
+    /// Coupon distribution is frozen because the project has an active dispute (#193).
+    ProjectDisputedAndFrozen = 19,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -34,6 +45,14 @@ pub enum OracleError {
     InvalidSignature = 10,
     InvalidResolution = 11,
     OverlappingReportPeriod = 12,
+    /// Fewer reporting oracle sources than required minimum quorum (#195).
+    InsufficientQuorum = 13,
+    /// Oracle reporting timestamp exceeds staleness threshold (#192).
+    OracleStale = 14,
+    /// Bond posted to open a dispute is below minimum requirement (#193).
+    DisputeBondInsufficient = 15,
+    /// Project is currently subject to an active dispute (#193).
+    ProjectDisputed = 16,
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -5,11 +5,14 @@ import {
 import { ProjectsService } from './projects.service';
 import { CreateProjectDto } from './dto/create-project.dto';
 import { PaginationDto } from '../common/dto/pagination.dto';
-import { ProjectResponse, ProjectProvenanceResponse } from './interfaces/project.interface';
+import { ProjectResponse, ProjectProvenanceResponse, CertificationVersion, CouponCertification } from './interfaces/project.interface';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
-import { AdminGuard } from '../common/guards/admin.guard';
+import { PermissionsGuard } from '../common/guards/permissions.guard';
+import { RequirePermissions } from '../common/decorators/permissions.decorator';
+import { Permission } from '../auth/rbac';
 import { IntentGuard } from '../common/guards/intent.guard';
 import { RequireIntent } from '../common/decorators/require-intent.decorator';
+import { AuthenticatedRequest } from '../common/interfaces/authenticated-request.interface';
 
 @Controller('projects')
 export class ProjectsController {
@@ -24,7 +27,7 @@ export class ProjectsController {
 
   @Get()
   async findAll(@Query() query: PaginationDto) {
-    return this.projectsService.findAll(query.page, query.limit);
+    return this.projectsService.findAll(query.page, query.limit, query.cursor);
   }
 
   @Get(':id')
@@ -42,7 +45,8 @@ export class ProjectsController {
   }
 
   @Post(':id/approve')
-  @UseGuards(JwtAuthGuard, AdminGuard, IntentGuard)
+  @UseGuards(JwtAuthGuard, PermissionsGuard, IntentGuard)
+  @RequirePermissions(Permission.APPROVE_PROJECT)
   @RequireIntent('approve_project')
   @HttpCode(HttpStatus.OK)
   async approve(
@@ -52,7 +56,8 @@ export class ProjectsController {
   }
 
   @Post(':id/reject')
-  @UseGuards(JwtAuthGuard, AdminGuard, IntentGuard)
+  @UseGuards(JwtAuthGuard, PermissionsGuard, IntentGuard)
+  @RequirePermissions(Permission.REJECT_PROJECT)
   @RequireIntent('reject_project')
   @HttpCode(HttpStatus.OK)
   async reject(
@@ -80,39 +85,28 @@ export class ProjectsController {
     return this.projectsService.exportProject(id, auditorAddress);
   }
 
-  @Get(':id/documents/:hash')
-  async getDocument(
+  @Post(':id/certifications')
+  @HttpCode(HttpStatus.CREATED)
+  async addCertification(
     @Param('id', ParseIntPipe) id: number,
-    @Param('hash') hash: string,
-  ): Promise<any> {
-    return this.projectsService.getDocument(id, hash);
+    @Body() body: { cid: string; kind?: 'performance-report' | 'third-party-certification' | 'document' },
+  ): Promise<CertificationVersion> {
+    return this.projectsService.addCertification(id, body.cid, body.kind ?? 'document');
   }
 
-  @Post(':id/documents/:hash/flag-audit')
-  @UseGuards(JwtAuthGuard)
-  @HttpCode(HttpStatus.OK)
-  async flagDocumentAsAudit(
+  @Get(':id/certifications')
+  async certificationHistory(
     @Param('id', ParseIntPipe) id: number,
-    @Param('hash') hash: string,
-    @Body() body: { disputeId?: string },
-  ): Promise<any> {
-    return this.projectsService.flagDocumentAsAudit(id, hash, body?.disputeId);
+  ): Promise<CertificationVersion[]> {
+    return this.projectsService.getCertificationHistory(id);
   }
 
-  @Post(':id/documents/:hash/escalate')
-  @HttpCode(HttpStatus.ACCEPTED)
-  async escalateDocument(
+  @Get(':id/coupon-certification')
+  async couponCertification(
     @Param('id', ParseIntPipe) id: number,
-    @Param('hash') hash: string,
-  ): Promise<any> {
-    return this.projectsService.escalateDocument(id, hash);
-  }
-
-  @Get(':id/documents/:hash/health')
-  async getDocumentHealth(
-    @Param('id', ParseIntPipe) id: number,
-    @Param('hash') hash: string,
-  ): Promise<any> {
-    return this.projectsService.getDocumentHealth(id, hash);
+    @Query('bondId', ParseIntPipe) bondId: number,
+    @Query('periodIndex', ParseIntPipe) periodIndex: number,
+  ): Promise<CouponCertification> {
+    return this.projectsService.getCouponCertification(id, bondId, periodIndex);
   }
 }
