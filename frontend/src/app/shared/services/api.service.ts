@@ -11,7 +11,7 @@ import {
   UndistributedTotalResponse, SweepUndistributedResponse,
   QuoteBalanceResponse, QuoteTransactionResponse,
   QuoteAsset, DepositQuoteDto, WithdrawQuoteDto, HolderResponse,
-  ClaimableCreditDetail, ClaimableCreditsResponse,
+  ClaimableCreditsResponse, CouponDistributionResponse, HolderListResponse, TransactionStatusResponse,
 } from '../interfaces/bond.interface';
 
 export interface ProblemDetails {
@@ -241,10 +241,10 @@ export class ApiService {
     }));
   }
 
-  mature(id: number): Observable<BondResponse> {
+  mature(id: number): Observable<Bond> {
     return this.withProblemDetails(defer(() => {
       const headers = this.headers(this.adminIntentHeader('mature_bond', String(id)));
-      return this.http.post<BondResponse>(
+      return this.http.post<Bond>(
         `/api/bonds/${id}/mature`,
         {},
         { headers },
@@ -346,6 +346,12 @@ export class ApiService {
     return this.http.delete<void>(`/api/marketplace/orders/${orderId}`, { headers: this.headers() });
   }
 
+  getTransactionStatus(hash: string): Observable<TransactionStatusResponse> {
+    return this.withProblemDetails(this.http.get<TransactionStatusResponse>(`/api/stellar/transactions/${hash}`, {
+      headers: this.headers(),
+    }));
+  }
+
   getQuoteBalance(asset: QuoteAsset = 'USDC'): Observable<QuoteBalanceResponse> {
     return this.withProblemDetails(this.http.get<QuoteBalanceResponse>('/api/marketplace/quote-balance', {
       params: { asset },
@@ -370,11 +376,11 @@ export class ApiService {
     return this.withProblemDetails(this.http.post<QuoteTransactionResponse>('/api/marketplace/withdraw', data, { headers }));
   }
 
-  getPortfolio(address?: string, force = false): Observable<any> {
+  getPortfolio(address?: string, force = false): Observable<unknown> {
     let params = new HttpParams();
     if (address) params = params.set('address', address);
     if (force) params = params.set('force', 'true');
-    return this.withProblemDetails(this.http.get<any>('/api/portfolio', {
+    return this.withProblemDetails(this.http.get<unknown>('/api/portfolio', {
       params,
       headers: this.headers(),
     }));
@@ -411,5 +417,9 @@ export class ApiService {
     return this.withProblemDetails(
       this.http.get<BondDetailResponse>(`/api/bonds/${id}/detail`, { params }),
     );
+  }
+
+  getTransactionStatus(hash: string): Observable<TransactionStatusResponse> {
+    return this.withProblemDetails(this.http.get<TransactionStatusResponse>(`/api/stellar/transactions/${hash}`));
   }
 }

@@ -1,21 +1,38 @@
 #![no_std]
 #![allow(deprecated)]
 use nbbs_shared::{BondConfig, BondError, BondStatus, CreditType, RedemptionCoverage};
-use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, Env, IntoVal, Symbol};
+use soroban_sdk::{BytesN, Vec, contract, contractimpl, contracttype, vec, Address, Env, IntoVal, Symbol};
 
 pub const MAX_SUPPLY: i128 = 1_000_000_000_000_000_000;
+
+/// Issue #188: versioned-interface convention. Bump on a breaking storage
+/// layout or interface change; see docs/upgrade-migrations.md.
+pub const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
+    CommittedRanges(BytesN<32>, u64),
     Admin,
     BondConfig(u64),
     BondState(u64),
     HolderBalance(u64, Address),
+    BalanceVersion(u64),
+    HolderCheckpointCount(u64, Address),
+    HolderCheckpoint(u64, Address, u32),
+    SupplyCheckpointCount(u64),
+    SupplyCheckpoint(u64, u32),
     RedemptionPool(u64),
     BondCount,
     Nonce(Address),
     ProjectRegistry,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct SerialRange {
+    pub start: i128,
+    pub end: i128,
 }
 
 #[derive(Clone, Debug)]
@@ -38,6 +55,165 @@ fn require_admin(env: &Env, caller: &Address) -> Result<(), BondError> {
         return Err(BondError::Unauthorized);
     }
     Ok(())
+}
+
+fn advance_balance_version(env: &Env, bond_id: u64) -> Result<u64, BondError> {
+    let current: u64 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::BalanceVersion(bond_id))
+        .unwrap_or(0);
+    let next = current.checked_add(1).ok_or(BondError::Overflow)?;
+    env.storage()
+        .persistent()
+        .set(&DataKey::BalanceVersion(bond_id), &next);
+    Ok(next)
+}
+
+fn append_holder_checkpoint(
+    env: &Env,
+    bond_id: u64,
+    holder: &Address,
+    version: u64,
+    previous_balance: i128,
+    balance: i128,
+) -> Result<(), BondError> {
+    let count_key = DataKey::HolderCheckpointCount(bond_id, holder.clone());
+    let mut index: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+    if index == 0 {
+        env.storage().persistent().set(
+            &DataKey::HolderCheckpoint(bond_id, holder.clone(), 0),
+            &BalanceCheckpoint {
+                version: 0,
+                balance: previous_balance,
+            },
+        );
+        index = 1;
+    }
+    env.storage().persistent().set(
+        &DataKey::HolderCheckpoint(bond_id, holder.clone(), index),
+        &BalanceCheckpoint { version, balance },
+    );
+    env.storage().persistent().set(
+        &count_key,
+        &index.checked_add(1).ok_or(BondError::Overflow)?,
+    );
+    Ok(())
+}
+
+fn append_supply_checkpoint(
+    env: &Env,
+    bond_id: u64,
+    version: u64,
+    previous_total_subscribed: i128,
+    total_subscribed: i128,
+) -> Result<(), BondError> {
+    let count_key = DataKey::SupplyCheckpointCount(bond_id);
+    let mut index: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+    if index == 0 {
+        env.storage().persistent().set(
+            &DataKey::SupplyCheckpoint(bond_id, 0),
+            &SupplyCheckpoint {
+                version: 0,
+                total_subscribed: previous_total_subscribed,
+            },
+        );
+        index = 1;
+    }
+    env.storage().persistent().set(
+        &DataKey::SupplyCheckpoint(bond_id, index),
+        &SupplyCheckpoint {
+            version,
+            total_subscribed,
+        },
+    );
+    env.storage().persistent().set(
+        &count_key,
+        &index.checked_add(1).ok_or(BondError::Overflow)?,
+    );
+    Ok(())
+}
+
+fn holder_balance_at_version(
+    env: &Env,
+    bond_id: u64,
+    holder: &Address,
+    version: u64,
+) -> Result<i128, BondError> {
+    let count: u32 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::HolderCheckpointCount(bond_id, holder.clone()))
+        .unwrap_or(0);
+    if count == 0 {
+        return Ok(env
+            .storage()
+            .persistent()
+            .get(&DataKey::HolderBalance(bond_id, holder.clone()))
+            .unwrap_or(0));
+    }
+    let mut low = 0u32;
+    let mut high = count;
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let checkpoint: BalanceCheckpoint = env
+            .storage()
+            .persistent()
+            .get(&DataKey::HolderCheckpoint(bond_id, holder.clone(), middle))
+            .ok_or(BondError::BondNotFound)?;
+        if checkpoint.version <= version {
+            low = middle.checked_add(1).ok_or(BondError::Overflow)?;
+        } else {
+            high = middle;
+        }
+    }
+    if low == 0 {
+        return Ok(0);
+    }
+    env.storage()
+        .persistent()
+        .get::<_, BalanceCheckpoint>(&DataKey::HolderCheckpoint(bond_id, holder.clone(), low - 1))
+        .map(|checkpoint| checkpoint.balance)
+        .ok_or(BondError::BondNotFound)
+}
+
+fn total_subscribed_at_version(env: &Env, bond_id: u64, version: u64) -> Result<i128, BondError> {
+    let count: u32 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::SupplyCheckpointCount(bond_id))
+        .unwrap_or(0);
+    if count == 0 {
+        let state: BondState = env
+            .storage()
+            .instance()
+            .get(&DataKey::BondState(bond_id))
+            .ok_or(BondError::BondNotFound)?;
+        return Ok(state.total_subscribed);
+    }
+    let mut low = 0u32;
+    let mut high = count;
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let checkpoint: SupplyCheckpoint = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SupplyCheckpoint(bond_id, middle))
+            .ok_or(BondError::BondNotFound)?;
+        if checkpoint.version <= version {
+            low = middle.checked_add(1).ok_or(BondError::Overflow)?;
+        } else {
+            high = middle;
+        }
+    }
+    if low == 0 {
+        return Ok(0);
+    }
+    env.storage()
+        .persistent()
+        .get::<_, SupplyCheckpoint>(&DataKey::SupplyCheckpoint(bond_id, low - 1))
+        .map(|checkpoint| checkpoint.total_subscribed)
+        .ok_or(BondError::BondNotFound)
 }
 
 fn consume_nonce(env: &Env, addr: &Address, nonce: u64) -> Result<(), BondError> {
@@ -102,8 +278,10 @@ impl BondIssuer {
         env: Env,
         current_admin: Address,
         new_admin: Address,
+        nonce: u64,
     ) -> Result<(), BondError> {
         current_admin.require_auth();
+        consume_nonce(&env, &current_admin, nonce)?;
         require_admin(&env, &current_admin)?;
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         env.events().publish(
@@ -118,6 +296,14 @@ impl BondIssuer {
             .instance()
             .get(&DataKey::Admin)
             .ok_or(BondError::NotInitialized)
+    }
+
+    /// Issue #188: versioned-interface convention — bump when the contract's
+    /// storage layout or callable interface changes in a breaking way. See
+    /// docs/upgrade-migrations.md.
+    pub fn schema_version(env: Env) -> u32 {
+        let _ = env;
+        SCHEMA_VERSION
     }
 
     pub fn set_project_registry(
@@ -203,6 +389,28 @@ impl BondIssuer {
             .instance()
             .get(&DataKey::BondCount)
             .unwrap_or(0);
+                let range_key = DataKey::CommittedRanges(config.project_id.clone(), config.credit_vintage);
+        let mut ranges: Vec<SerialRange> = env.storage().persistent().get(&range_key).unwrap_or(vec![&env]);
+        
+        let new_start = config.serial_number_start;
+        let new_end = config.serial_number_end;
+        
+        if new_start > new_end {
+            return Err(BondError::InvalidSupply);
+        }
+        
+        for i in 0..ranges.len() {
+            let r = ranges.get(i).unwrap();
+            let max_start = if new_start > r.start { new_start } else { r.start };
+            let min_end = if new_end < r.end { new_end } else { r.end };
+            if max_start <= min_end {
+                return Err(BondError::InvalidSupply);
+            }
+        }
+        
+        ranges.push_back(SerialRange { start: new_start, end: new_end });
+        env.storage().persistent().set(&range_key, &ranges);
+
         let bond_id = count + 1;
         env.storage().instance().set(&DataKey::BondCount, &bond_id);
 
@@ -218,6 +426,19 @@ impl BondIssuer {
         env.storage()
             .instance()
             .set(&DataKey::BondState(bond_id), &state);
+        env.storage()
+            .persistent()
+            .set(&DataKey::BalanceVersion(bond_id), &0u64);
+        env.storage().persistent().set(
+            &DataKey::SupplyCheckpoint(bond_id, 0),
+            &SupplyCheckpoint {
+                version: 0,
+                total_subscribed: 0,
+            },
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::SupplyCheckpointCount(bond_id), &1u32);
 
         env.events().publish(
             (Symbol::new(&env, "bond_issued"),),
@@ -276,10 +497,21 @@ impl BondIssuer {
             .ok_or(BondError::Overflow)?;
         env.storage().persistent().set(&balance_key, &new_balance);
 
+        let previous_total = state.total_subscribed;
         state.total_subscribed = new_total;
         env.storage()
             .instance()
             .set(&DataKey::BondState(bond_id), &state);
+        let version = advance_balance_version(&env, bond_id)?;
+        append_holder_checkpoint(
+            &env,
+            bond_id,
+            &investor,
+            version,
+            current_balance,
+            new_balance,
+        )?;
+        append_supply_checkpoint(&env, bond_id, version, previous_total, new_total)?;
 
         env.events().publish(
             (Symbol::new(&env, "subscribed"),),
@@ -341,6 +573,16 @@ impl BondIssuer {
         let to_balance: i128 = env.storage().persistent().get(&to_key).unwrap_or(0);
         let new_to_balance = to_balance.checked_add(amount).ok_or(BondError::Overflow)?;
         env.storage().persistent().set(&to_key, &new_to_balance);
+        let version = advance_balance_version(&env, bond_id)?;
+        append_holder_checkpoint(
+            &env,
+            bond_id,
+            &from,
+            version,
+            from_balance,
+            new_from_balance,
+        )?;
+        append_holder_checkpoint(&env, bond_id, &to, version, to_balance, new_to_balance)?;
 
         env.events().publish(
             (Symbol::new(&env, "transferred"),),
@@ -429,6 +671,7 @@ impl BondIssuer {
             .ok_or(BondError::Overflow)?;
         env.storage().persistent().set(&balance_key, &new_balance);
 
+        let previous_total = state.total_subscribed;
         state.total_subscribed = state
             .total_subscribed
             .checked_sub(amount)
@@ -436,6 +679,22 @@ impl BondIssuer {
         env.storage()
             .instance()
             .set(&DataKey::BondState(bond_id), &state);
+        let version = advance_balance_version(&env, bond_id)?;
+        append_holder_checkpoint(
+            &env,
+            bond_id,
+            &holder,
+            version,
+            current_balance,
+            new_balance,
+        )?;
+        append_supply_checkpoint(
+            &env,
+            bond_id,
+            version,
+            previous_total,
+            state.total_subscribed,
+        )?;
 
         env.events().publish(
             (Symbol::new(&env, "redeemed"),),
@@ -464,6 +723,30 @@ impl BondIssuer {
             .persistent()
             .get(&DataKey::HolderBalance(bond_id, holder))
             .unwrap_or(0)
+    }
+
+    pub fn get_balance_version(env: Env, bond_id: u64) -> Result<u64, BondError> {
+        if !env.storage().instance().has(&DataKey::BondState(bond_id)) {
+            return Err(BondError::BondNotFound);
+        }
+        Ok(env
+            .storage()
+            .persistent()
+            .get(&DataKey::BalanceVersion(bond_id))
+            .unwrap_or(0))
+    }
+
+    pub fn get_holder_balance_at_version(
+        env: Env,
+        bond_id: u64,
+        holder: Address,
+        version: u64,
+    ) -> Result<i128, BondError> {
+        let current_version = Self::get_balance_version(env.clone(), bond_id)?;
+        if version > current_version {
+            return Err(BondError::InvalidBalanceSnapshot);
+        }
+        holder_balance_at_version(&env, bond_id, &holder, version)
     }
 
     pub fn get_redemption_pool(env: Env, bond_id: u64) -> i128 {
@@ -560,6 +843,18 @@ impl BondIssuer {
         Ok(state.total_subscribed)
     }
 
+    pub fn total_subscribed_at_version(
+        env: Env,
+        bond_id: u64,
+        version: u64,
+    ) -> Result<i128, BondError> {
+        let current_version = Self::get_balance_version(env.clone(), bond_id)?;
+        if version > current_version {
+            return Err(BondError::InvalidBalanceSnapshot);
+        }
+        total_subscribed_at_version(&env, bond_id, version)
+    }
+
     pub fn bond_count(env: Env) -> u64 {
         env.storage()
             .instance()
@@ -607,6 +902,63 @@ impl BondIssuer {
 
         Ok(())
     }
+    /// Dry run of `subscribe` for `amount` units of `bond_id`.
+    ///
+    /// Read-only: no authorization is required and no nonce is consumed. Walks
+    /// the same checks as `subscribe`, in the same order, and reports the
+    /// first one that would fail as `expected_failure` instead of returning an
+    /// error, so callers can size an order before paying for a transaction.
+    /// Only an unknown bond is an error, since there is nothing to preview.
+    /// The per-holder balance overflow check in `subscribe` is not modelled
+    /// because the preview has no investor.
+    /// Dry run of `subscribe` for `amount` units of `bond_id`.
+    ///
+    /// Read-only: no authorization is required and no nonce is consumed. Walks
+    /// the same checks as `subscribe`, in the same order, and reports the
+    /// first one that would fail as `expected_failure` instead of returning an
+    /// error, so callers can size an order before paying for a transaction.
+    /// Only an unknown bond is an error, since there is nothing to preview.
+    /// The per-holder balance overflow check in `subscribe` is not modelled
+    /// because the preview has no investor.
+    pub fn preview_subscribe(
+        env: Env,
+        bond_id: u64,
+        amount: i128,
+    ) -> Result<PreviewSubscription, BondError> {
+        let config: BondConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::BondConfig(bond_id))
+            .ok_or(BondError::BondNotFound)?;
+
+        let state: BondState = env
+            .storage()
+            .instance()
+            .get(&DataKey::BondState(bond_id))
+            .ok_or(BondError::BondNotFound)?;
+
+        let expected_failure = if amount <= 0 {
+            Some(BondError::ZeroAmount as u32)
+        } else if state.status != BondStatus::Active
+            || env.ledger().timestamp() >= config.maturity_date
+        {
+            Some(BondError::BondAlreadyMatured as u32)
+        } else {
+            match state.total_subscribed.checked_add(amount) {
+                None => Some(BondError::Overflow as u32),
+                Some(new_total) if new_total > config.total_supply => {
+                    Some(BondError::InsufficientSupply as u32)
+                }
+                Some(_) => None,
+            }
+        };
+
+        Ok(PreviewSubscription {
+            remaining_supply: config.total_supply - state.total_subscribed,
+            requested_amount: amount,
+            expected_failure,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -627,7 +979,11 @@ mod test {
             coupon_schedule: vec![&env, 1000000u64, 2000000u64],
             credit_type: nbbs_shared::CreditType::Carbon,
             maturity_date: 3000000,
-            total_supply: 10000,
+            total_supply: 10_000,
+            credit_vintage: 2024,
+            serial_number_start: 1,
+            serial_number_end: 10_000,
+            
         }
     }
 
@@ -639,6 +995,82 @@ mod test {
         let contract_id = env.register(BondIssuer, (&admin,));
         let client = BondIssuerClient::new(&env, &contract_id);
         (env, client, admin, user)
+    }
+
+
+    #[test]
+    fn test_issue_bond_overlap_detection() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let id = env.register(BondIssuer, (admin.clone(),));
+        let client = BondIssuerClient::new(&env, &id);
+
+        let config1 = BondConfig {
+            project_id: create_project_id(&env, 1),
+            face_value: 1000,
+            coupon_schedule: vec![&env, 1000u64],
+            credit_type: CreditType::Carbon,
+            maturity_date: 2000,
+            total_supply: 10_000,
+            credit_vintage: 2024,
+            serial_number_start: 100,
+            serial_number_end: 200,
+        };
+        assert_eq!(client.issue_bond(&admin, &config1, &0), 1);
+
+        // Near-miss (adjacent) - before
+        let config2 = BondConfig {
+            project_id: create_project_id(&env, 1),
+            face_value: 1000,
+            coupon_schedule: vec![&env, 1000u64],
+            credit_type: CreditType::Carbon,
+            maturity_date: 2000,
+            total_supply: 10_000,
+            credit_vintage: 2024,
+            serial_number_start: 50,
+            serial_number_end: 99,
+        };
+        assert_eq!(client.issue_bond(&admin, &config2, &1), 2);
+
+        // Near-miss (adjacent) - after
+        let config3 = BondConfig {
+            project_id: create_project_id(&env, 1),
+            face_value: 1000,
+            coupon_schedule: vec![&env, 1000u64],
+            credit_type: CreditType::Carbon,
+            maturity_date: 2000,
+            total_supply: 10_000,
+            credit_vintage: 2024,
+            serial_number_start: 201,
+            serial_number_end: 300,
+        };
+        assert_eq!(client.issue_bond(&admin, &config3, &2), 3);
+
+        // Exact overlap
+        let mut config_overlap = config1.clone();
+        config_overlap.serial_number_start = 150;
+        config_overlap.serial_number_end = 250;
+        assert_eq!(client.try_issue_bond(&admin, &config_overlap, &3), Err(Ok(BondError::InvalidSupply)));
+
+        // Subset
+        let mut config_subset = config1.clone();
+        config_subset.serial_number_start = 120;
+        config_subset.serial_number_end = 180;
+        assert_eq!(client.try_issue_bond(&admin, &config_subset, &3), Err(Ok(BondError::InvalidSupply)));
+        
+        // Overlap boundary - start
+        let mut config_b1 = config1.clone();
+        config_b1.serial_number_start = 90;
+        config_b1.serial_number_end = 100;
+        assert_eq!(client.try_issue_bond(&admin, &config_b1, &3), Err(Ok(BondError::InvalidSupply)));
+
+        // Overlap boundary - end
+        let mut config_b2 = config1.clone();
+        config_b2.serial_number_start = 200;
+        config_b2.serial_number_end = 210;
+        assert_eq!(client.try_issue_bond(&admin, &config_b2, &3), Err(Ok(BondError::InvalidSupply)));
     }
 
     #[test]
@@ -709,11 +1141,15 @@ mod test {
         let new_admin = Address::generate(&env);
         let config = make_config(&env);
 
-        client.set_admin(&admin, &new_admin);
+        assert_eq!(
+            client.try_set_admin(&admin, &new_admin, &1),
+            Err(Ok(BondError::InvalidNonce))
+        );
+        client.set_admin(&admin, &new_admin, &0);
         assert_eq!(client.get_admin(), new_admin);
 
         assert_eq!(
-            client.try_issue_bond(&admin, &config, &0),
+            client.try_issue_bond(&admin, &config, &1),
             Err(Ok(BondError::Unauthorized))
         );
         assert_eq!(client.issue_bond(&new_admin, &config, &0), 1);
@@ -1053,6 +1489,38 @@ mod test {
     }
 
     #[test]
+    fn test_balance_checkpoints_preserve_settlement_snapshot() {
+        let (env, client, admin, holder) = setup();
+        let recipient = Address::generate(&env);
+        let bond_id = client.issue_bond(&admin, &make_config(&env), &0);
+        client.subscribe(&holder, &bond_id, &1_000, &0);
+        let settlement_version = client.get_balance_version(&bond_id);
+
+        client.transfer(&holder, &recipient, &bond_id, &400, &1);
+        let later_subscriber = Address::generate(&env);
+        client.subscribe(&later_subscriber, &bond_id, &500, &0);
+        assert_eq!(
+            client.get_holder_balance_at_version(&bond_id, &holder, &settlement_version),
+            1_000
+        );
+        assert_eq!(
+            client.get_holder_balance_at_version(&bond_id, &recipient, &settlement_version),
+            0
+        );
+        assert_eq!(
+            client.total_subscribed_at_version(&bond_id, &settlement_version),
+            1_000
+        );
+        assert_eq!(client.total_subscribed(&bond_id), 1_500);
+        assert_eq!(client.get_holder_balance(&bond_id, &holder), 600);
+        assert_eq!(client.get_holder_balance(&bond_id, &recipient), 400);
+        assert_eq!(
+            client.try_get_holder_balance_at_version(&bond_id, &holder, &4),
+            Err(Ok(BondError::InvalidBalanceSnapshot))
+        );
+    }
+
+    #[test]
     fn test_transfer_more_than_owned() {
         let (env, client, admin, user) = setup();
         let user2 = Address::generate(&env);
@@ -1149,8 +1617,68 @@ mod test {
         assert_eq!(bond_id, 1);
         assert_eq!(client.bond_count(), 1);
 
-        client.issue_bond(&admin, &config, &1);
+                let mut config2 = config.clone();
+        config2.serial_number_start = 10001;
+        config2.serial_number_end = 20000;
+        client.issue_bond(&admin, &config2, &1);
         assert_eq!(client.bond_count(), 2);
+    }
+
+    #[test]
+    fn test_preview_subscribe_clean_order() {
+        let (env, client, admin, _user) = setup();
+        let bond_id = client.issue_bond(&admin, &make_config(&env), &0);
+
+        let preview = client.preview_subscribe(&bond_id, &100);
+        assert_eq!(preview.remaining_supply, 10000);
+        assert_eq!(preview.requested_amount, 100);
+        assert_eq!(preview.expected_failure, None);
+    }
+
+    #[test]
+    fn test_preview_subscribe_reports_each_failure() {
+        let (env, client, admin, user) = setup();
+        let config = make_config(&env);
+        let bond_id = client.issue_bond(&admin, &config, &0);
+
+        assert_eq!(
+            client.preview_subscribe(&bond_id, &0).expected_failure,
+            Some(BondError::ZeroAmount as u32)
+        );
+        assert_eq!(
+            client.preview_subscribe(&bond_id, &10001).expected_failure,
+            Some(BondError::InsufficientSupply as u32)
+        );
+
+        client.subscribe(&user, &bond_id, &4000, &0);
+        let preview = client.preview_subscribe(&bond_id, &6001);
+        assert_eq!(preview.remaining_supply, 6000);
+        assert_eq!(
+            preview.expected_failure,
+            Some(BondError::InsufficientSupply as u32)
+        );
+        assert_eq!(
+            client.preview_subscribe(&bond_id, &6000).expected_failure,
+            None
+        );
+
+        assert_eq!(
+            client
+                .preview_subscribe(&bond_id, &i128::MAX)
+                .expected_failure,
+            Some(BondError::Overflow as u32)
+        );
+
+        env.ledger().set_timestamp(config.maturity_date);
+        assert_eq!(
+            client.preview_subscribe(&bond_id, &1).expected_failure,
+            Some(BondError::BondAlreadyMatured as u32)
+        );
+
+        assert_eq!(
+            client.try_preview_subscribe(&99, &1),
+            Err(Ok(BondError::BondNotFound))
+        );
     }
 
     mod property {
@@ -1169,6 +1697,45 @@ mod test {
             // and transfers the sum of holder balances always equals
             // total_subscribed, never exceeds total_supply, and each balance is
             // non-negative.
+            // The preview is only useful if it never lies: for any amount, the
+            // failure it predicts is exactly what subscribe then returns, and a
+            // clean preview is always followed by a successful subscription.
+            #[test]
+            fn preview_subscribe_agrees_with_subscribe(
+                supply in 1i128..100_000i128,
+                amounts in proptest::collection::vec(-100i128..60_000i128, 1..20),
+            ) {
+                let env = Env::default();
+                env.mock_all_auths();
+                let admin = Address::generate(&env);
+                let user = Address::generate(&env);
+                let contract_id = env.register(BondIssuer, (&admin,));
+                let client = BondIssuerClient::new(&env, &contract_id);
+
+                let mut config = make_config(&env);
+                config.total_supply = supply;
+                let bond_id = client.issue_bond(&admin, &config, &0);
+
+                let mut nonce = 0u64;
+                let mut total_subscribed = 0i128;
+                for amount in amounts {
+                    let preview = client.preview_subscribe(&bond_id, &amount);
+                    prop_assert_eq!(preview.remaining_supply, supply - total_subscribed);
+                    prop_assert_eq!(preview.requested_amount, amount);
+
+                    let actual = match client.try_subscribe(&user, &bond_id, &amount, &nonce) {
+                        Ok(_) => {
+                            nonce += 1;
+                            total_subscribed += amount;
+                            None
+                        }
+                        Err(Ok(e)) => Some(e as u32),
+                        Err(Err(e)) => return Err(TestCaseError::fail(std::format!("{e:?}"))),
+                    };
+                    prop_assert_eq!(preview.expected_failure, actual);
+                }
+            }
+
             #[test]
             fn subscription_conserves_supply(
                 supply in 100i128..1_000_000i128,

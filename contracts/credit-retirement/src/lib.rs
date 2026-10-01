@@ -5,6 +5,10 @@ use soroban_sdk::{
     contract, contractimpl, contracttype, vec, Address, BytesN, Env, IntoVal, Symbol, Vec,
 };
 
+/// Issue #188: versioned-interface convention. Bump on a breaking storage
+/// layout or interface change; see docs/upgrade-migrations.md.
+pub const SCHEMA_VERSION: u32 = 1;
+
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
@@ -122,18 +126,29 @@ impl CreditRetirement {
             .ok_or(CreditError::NotInitialized)?;
         let accrued: i128 = env.invoke_contract(
             &coupon_engine,
-            &Symbol::new(&env, "accrued_credits"),
+            &Symbol::new(&env, "escrowed_credits"),
             vec![&env, bond_id.into_val(&env), holder.clone().into_val(&env)],
+        );
+
+        if amount > accrued {
+            return Err(CreditError::InsufficientCredits);
+        }
+
+        // Settle against the coupon ledger before minting anything: the same
+        // credits must not be retirable here and later claimable there.
+        env.invoke_contract::<()>(
+            &coupon_engine,
+            &Symbol::new(&env, "consume_credits"),
+            vec![
+                &env,
+                holder.clone().into_val(&env),
+                bond_id.into_val(&env),
+                amount.into_val(&env),
+            ],
         );
 
         let retired_key = DataKey::RetiredPerBond(bond_id, holder.clone());
         let already_retired: i128 = env.storage().instance().get(&retired_key).unwrap_or(0);
-        let remaining = accrued
-            .checked_sub(already_retired)
-            .ok_or(CreditError::InsufficientCredits)?;
-        if amount > remaining {
-            return Err(CreditError::InsufficientCredits);
-        }
         env.storage()
             .instance()
             .set(&retired_key, &(already_retired + amount));
@@ -275,6 +290,14 @@ impl CreditRetirement {
             .get(&DataKey::Admin)
             .ok_or(CreditError::NotInitialized)
     }
+
+    /// Issue #188: versioned-interface convention — bump when the contract's
+    /// storage layout or callable interface changes in a breaking way. See
+    /// docs/upgrade-migrations.md.
+    pub fn schema_version(env: Env) -> u32 {
+        let _ = env;
+        SCHEMA_VERSION
+    }
 }
 
 fn require_admin(env: &Env, caller: &Address) -> Result<(), CreditError> {
@@ -331,6 +354,20 @@ mod test {
             &0,
         );
         oc_client.verify_report(admin, &report_id, &1);
+
+        // DEFAULT_SIGNATURE_THRESHOLD is 2, so the admin's verification alone
+        // leaves the report Pending. Register a second, independently staked
+        // verifier to reach the threshold, matching the oracle design doc and
+        // coupon-engine's submit_verified_report helper.
+        let second_verifier = Address::generate(env);
+        oc_client.register_provider(admin, &second_verifier, &Symbol::new(env, "satellite"), &2);
+        oc_client.add_stake(
+            &second_verifier,
+            &nbbs_oracle_consumer::DEFAULT_MIN_VERIFIER_STAKE,
+            &0,
+        );
+        oc_client.verify_report(&second_verifier, &report_id, &1);
+
         report_id
     }
 
@@ -341,6 +378,7 @@ mod test {
         holder: Address,
         bond_id: u64,
         accrued: i128,
+        ce_client: CouponEngineClient<'static>,
     }
 
     fn setup() -> Setup {
@@ -362,7 +400,10 @@ mod test {
             credit_type: CreditType::Carbon,
             maturity_date: 3_000_000,
             total_supply: 10_000,
-        };
+            credit_vintage: 2024,
+            serial_number_start: 1,
+            serial_number_end: 10_000,
+            };
         let bond_id = issuer_client.issue_bond(&issuer_admin, &bond_config, &0);
         issuer_client.subscribe(&holder, &bond_id, &10_000, &0);
 
@@ -378,7 +419,7 @@ mod test {
 
         let holders = svec![&env, holder.clone()];
         ce_client.distribute_coupon(&admin, &bond_id, &0, &holders, &report_id, &1);
-        let accrued = ce_client.accrued_credits(&bond_id, &holder);
+        let accrued = ce_client.escrowed_credits(&bond_id, &holder);
         assert!(accrued > 0);
 
         let contract_id = env.register(
@@ -394,7 +435,42 @@ mod test {
             holder,
             bond_id,
             accrued,
+            ce_client,
         }
+    }
+
+    #[test]
+    fn test_retire_debits_coupon_ledger_and_blocks_double_spend() {
+        let s = setup();
+        let half = s.accrued / 2;
+
+        s.client.retire_credits(
+            &s.holder,
+            &s.bond_id,
+            &half,
+            &CreditType::Carbon,
+            &make_certificate_hash(&s._env, 1),
+            &0,
+        );
+        assert_eq!(
+            s.ce_client.escrowed_credits(&s.bond_id, &s.holder),
+            s.accrued - half
+        );
+
+        s.client.retire_credits(
+            &s.holder,
+            &s.bond_id,
+            &(s.accrued - half),
+            &CreditType::Carbon,
+            &make_certificate_hash(&s._env, 2),
+            &1,
+        );
+        assert_eq!(s.ce_client.escrowed_credits(&s.bond_id, &s.holder), 0);
+
+        // Retired credits are gone from the coupon ledger, so a claim after
+        // retirement yields nothing.
+        assert_eq!(s.ce_client.claim_credits(&s.holder, &s.bond_id, &0), 0);
+        assert_eq!(s.client.get_total_retired(&s.holder), s.accrued);
     }
 
     #[test]
@@ -582,7 +658,10 @@ mod test {
             credit_type: CreditType::Carbon,
             maturity_date: 3_000_000,
             total_supply: 10_000,
-        };
+            credit_vintage: 2024,
+            serial_number_start: 1,
+            serial_number_end: 10_000,
+            };
         let bond_id = issuer_client.issue_bond(&issuer_admin, &bond_config, &0);
         issuer_client.subscribe(&holder1, &bond_id, &3_000, &0);
         issuer_client.subscribe(&holder2, &bond_id, &7_000, &0);
@@ -600,8 +679,8 @@ mod test {
         let holders = svec![&env, holder1.clone(), holder2.clone()];
         ce_client.distribute_coupon(&admin, &bond_id, &0, &holders, &report_id, &1);
 
-        let accrued1 = ce_client.accrued_credits(&bond_id, &holder1);
-        let accrued2 = ce_client.accrued_credits(&bond_id, &holder2);
+        let accrued1 = ce_client.escrowed_credits(&bond_id, &holder1);
+        let accrued2 = ce_client.escrowed_credits(&bond_id, &holder2);
         assert!(accrued1 > 0);
         assert!(accrued2 > 0);
 

@@ -13,7 +13,8 @@ pub fn transfer(from, to, bond_id, amount, nonce)   // replay-protected on-chain
 pub fn fund_redemption(caller, bond_id, amount, nonce)  // admin funds principal escrow
 pub fn redeem(...)
 pub fn mature_bond(...)
-pub fn set_admin(current_admin, new_admin)
+pub fn preview_subscribe(bond_id, amount)          // read-only dry run: remaining supply + the error subscribe would return
+pub fn set_admin(current_admin, new_admin, nonce)
 pub fn get_admin()
 pub fn get_bond(...)
 pub fn get_bond_state(...)
@@ -29,6 +30,7 @@ pub fn bond_count(...)
 // Public functions
 pub fn distribute_coupon(caller, bond_id, period, holders, report_id, nonce)
 pub fn claim_credits(caller, bond_id, nonce)   // withdraw accrued credits
+pub fn consume_credits(holder, bond_id, amount)  // holder-authorized debit; called by CreditRetirement before it mints a certificate
 pub fn sweep_undistributed(caller, bond_id, nonce)  // admin-only dust recovery
 pub fn accrued_credits(...)
 pub fn accrued_credits_by_type(bond_id, holder, credit_type)  // per-type split for Basket bonds
@@ -49,8 +51,10 @@ pub fn submit_report(...)
 pub fn verify_report(...)            // independent verifier endorsement
 pub fn challenge_report(...)
 pub fn resolve_challenge(...)        // admin verdict; Rejected slashes 10% stake
+pub fn slash_provider(caller, provider, report_id, nonce)  // admin: apply the slash directly
+pub fn preview_slash(provider, report_id)             // read-only: penalty and remaining stake
 pub fn set_signature_threshold(...)  // required independent verifications
-pub fn set_admin(current_admin, new_admin)
+pub fn set_admin(current_admin, new_admin, nonce)
 pub fn get_admin()
 pub fn get_report(...)
 pub fn get_provider(...)
@@ -69,7 +73,7 @@ pub fn list_bond_tokens(...)   // escrow bond tokens at listing time
 pub fn execute_purchase(...)   // verify escrow, atomically transfer bonds + quote
 pub fn cancel_listing(...)     // release escrowed bond tokens
 pub fn get_seller_bond_escrow(...)  // query escrowed bond balance
-pub fn set_admin(current_admin, new_admin)
+pub fn set_admin(current_admin, new_admin, nonce)
 pub fn get_admin()
 pub fn clean_expired_orders(caller, start_id, limit, nonce)  // batched expired cleanup
 pub fn get_order(...)
@@ -89,6 +93,7 @@ pub fn get_project(...)
 pub fn get_all_projects(...)
 pub fn has_approved_project(key)               // view: true iff status == Approved
 pub fn project_key(project_id)                 // helper: u64 -> BytesN<32> storage key
+pub fn add_project_documents(caller, project_id, hashes, nonce)  // owner or admin only
 ```
 
 ### CreditRetirement
@@ -212,8 +217,8 @@ Reports follow a strict status lifecycle managed by `OracleConsumer`:
 
 ## Admin Rotation
 
-- `BondIssuer`, `OracleConsumer`, and `DEXRouter` expose `set_admin(current_admin, new_admin)` and `get_admin()`.
-- `set_admin` requires authorization from the current admin address and emits `admin_changed`.
+- Every admin-bearing contract exposes `set_admin(current_admin, new_admin, nonce)` and `get_admin()`.
+- `set_admin` requires authorization from the current admin address, consumes that admin's nonce, and emits `admin_changed`. The trailing nonce is what lets `Governance.execute` drive it; see docs/access-control-review.md.
 - Production rotations should be scheduled through the Governance contract's timelock and executed by the current HSM-held admin key after review.
 
 ## Marketplace Settlement
