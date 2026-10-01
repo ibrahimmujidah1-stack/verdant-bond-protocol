@@ -1,12 +1,32 @@
 #![no_std]
 #![allow(deprecated)]
-use nbbs_shared::{BiodiversityMetrics, OracleError, ReportStatus};
+#![allow(clippy::too_many_arguments)]
+use nbbs_shared::{
+    BiodiversityMetrics, OracleError, ProjectStalenessConfig, ReportStatus, StalenessState,
+};
 use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, BytesN, Env, Symbol, Vec};
 
 pub const CHALLENGE_WINDOW_SECONDS: u64 = 259200;
 pub const SLASH_PENALTY_PPM: i128 = 100_000;
-pub const DEFAULT_SIGNATURE_THRESHOLD: u32 = 1;
+/// Minimum number of distinct qualifying verifiers before a report reaches
+/// `Verified`. Two, so that no single address can verify a report on its own:
+/// `qualifying_verifier_count` counts the admin unconditionally, so a default
+/// of one let the admin alone verify any report, which contradicts the
+/// multi-source guarantee in docs/oracle-design.md. Override per deployment
+/// with `set_signature_threshold`.
+pub const DEFAULT_SIGNATURE_THRESHOLD: u32 = 2;
 pub const DEFAULT_MIN_VERIFIER_STAKE: i128 = 10_000;
+
+/// Default minimum quorum for multi-oracle aggregation (#195).
+pub const DEFAULT_MIN_QUORUM: u32 = 1;
+/// Default minimum bond to open a dispute (#193).
+pub const DEFAULT_MIN_DISPUTE_BOND: i128 = 0;
+/// Maximum allowed deviation from aggregate score before provider is slashed (#195).
+pub const MAX_ALLOWED_DEVIATION_BPS: i128 = 3_000;
+
+/// Issue #188: versioned-interface convention. Bump on a breaking storage
+/// layout or interface change; see docs/upgrade-migrations.md.
+pub const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone)]
 #[contracttype]
@@ -27,6 +47,11 @@ pub enum DataKey {
     ProviderReportCount(Address),
     ProviderChallenges(Address),
     SlashHistory(Address),
+    MinimumQuorum,
+    MinimumDisputeBond,
+    ProjectDisputed(BytesN<32>),
+    ProjectStalenessConfig(BytesN<32>),
+    ProjectLastVerifiedAt(BytesN<32>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -39,23 +64,7 @@ pub struct OracleProvider {
     pub registered_at: u64,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-#[contracttype]
-pub struct Report {
-    pub id: u64,
-    pub provider: Address,
-    pub project_id: BytesN<32>,
-    pub period_start: u64,
-    pub period_end: u64,
-    pub carbon_sequestered: i128,
-    pub biodiversity: BiodiversityMetrics,
-    pub methodology: Symbol,
-    pub ipfs_evidence_hash: BytesN<32>,
-    pub status: ReportStatus,
-    pub submitted_at: u64,
-    pub verified_at: u64,
-    pub provider_stake_at_verification: Option<i128>,
-}
+pub use nbbs_shared::Report;
 
 #[derive(Clone)]
 #[contracttype]
@@ -152,8 +161,16 @@ impl OracleConsumer {
         env: Env,
         current_admin: Address,
         new_admin: Address,
+        nonce: u64,
     ) -> Result<(), OracleError> {
         current_admin.require_auth();
+
+        let expected_nonce = get_nonce(&env, &current_admin);
+        if nonce != expected_nonce {
+            return Err(OracleError::InvalidNonce);
+        }
+        set_nonce(&env, &current_admin, expected_nonce + 1);
+
         require_admin(&env, &current_admin)?;
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         env.events().publish(
@@ -168,6 +185,14 @@ impl OracleConsumer {
             .instance()
             .get(&DataKey::Admin)
             .ok_or(OracleError::NotInitialized)
+    }
+
+    /// Issue #188: versioned-interface convention — bump when the contract's
+    /// storage layout or callable interface changes in a breaking way. See
+    /// docs/upgrade-migrations.md.
+    pub fn schema_version(env: Env) -> u32 {
+        let _ = env;
+        SCHEMA_VERSION
     }
 
     pub fn register_provider(
@@ -399,7 +424,7 @@ impl OracleConsumer {
             .get(&DataKey::Report(report_id))
             .ok_or(OracleError::ReportNotFound)?;
 
-        if report.status != ReportStatus::Pending {
+        if report.status == ReportStatus::Challenged || report.status == ReportStatus::Rejected {
             return Err(OracleError::ReportAlreadyVerified);
         }
 
@@ -460,13 +485,17 @@ impl OracleConsumer {
                 .get::<_, OracleProvider>(&DataKey::Provider(report.provider.clone()))
                 .map(|p| p.stake)
                 .unwrap_or(0);
-                
+
             report.status = ReportStatus::Verified;
             report.verified_at = env.ledger().timestamp();
             report.provider_stake_at_verification = Some(provider_stake);
             env.storage()
                 .instance()
                 .set(&DataKey::Report(report_id), &report);
+            env.storage().instance().set(
+                &DataKey::ProjectLastVerifiedAt(report.project_id.clone()),
+                &report.verified_at,
+            );
 
             env.events()
                 .publish((Symbol::new(&env, "report_verified"),), (report_id,));
@@ -498,6 +527,21 @@ impl OracleConsumer {
 
         if report.status != ReportStatus::Pending && report.status != ReportStatus::Verified {
             return Err(OracleError::ReportAlreadyVerified);
+        }
+
+        let min_dispute_bond = Self::get_minimum_dispute_bond(env.clone());
+        if min_dispute_bond > 0 {
+            let is_admin = require_admin(&env, &challenger).is_ok();
+            if !is_admin {
+                let p: Option<OracleProvider> = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Provider(challenger.clone()));
+                let stake = p.map(|p_val| p_val.stake).unwrap_or(0);
+                if stake < min_dispute_bond {
+                    return Err(OracleError::DisputeBondInsufficient);
+                }
+            }
         }
 
         let now = env.ledger().timestamp();
@@ -540,6 +584,10 @@ impl OracleConsumer {
         env.storage()
             .instance()
             .set(&DataKey::Report(report_id), &report_mut);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::ProjectDisputed(report.project_id.clone()), &true);
 
         let mut provider_challenges: Vec<u64> = env
             .storage()
@@ -607,14 +655,283 @@ impl OracleConsumer {
             .instance()
             .set(&DataKey::Report(report_id), &report);
 
+        env.storage()
+            .instance()
+            .set(&DataKey::ProjectDisputed(report.project_id.clone()), &false);
+
         if resolution == ReportStatus::Rejected {
             slash_provider(&env, &report.provider, report_id)?;
+        } else if resolution == ReportStatus::Verified {
+            // Bad faith dispute: slash challenger if challenger is a provider
+            if let Some(mut p) = env
+                .storage()
+                .instance()
+                .get::<_, OracleProvider>(&DataKey::Provider(challenge.challenger.clone()))
+            {
+                let penalty = (p.stake * SLASH_PENALTY_PPM) / 1_000_000;
+                p.stake = p.stake.saturating_sub(penalty);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Provider(challenge.challenger.clone()), &p);
+            }
         }
 
         env.events()
             .publish((Symbol::new(&env, "challenge_resolved"),), (report_id,));
 
         Ok(())
+    }
+
+    // Quorum management (#195)
+    pub fn set_minimum_quorum(
+        env: Env,
+        caller: Address,
+        quorum: u32,
+        nonce: u64,
+    ) -> Result<(), OracleError> {
+        caller.require_auth();
+        let expected_nonce = get_nonce(&env, &caller);
+        if nonce != expected_nonce {
+            return Err(OracleError::InvalidNonce);
+        }
+        set_nonce(&env, &caller, expected_nonce + 1);
+        require_admin(&env, &caller)?;
+        if quorum == 0 {
+            return Err(OracleError::InsufficientQuorum);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MinimumQuorum, &quorum);
+        Ok(())
+    }
+
+    pub fn get_minimum_quorum(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MinimumQuorum)
+            .unwrap_or(DEFAULT_MIN_QUORUM)
+    }
+
+    // Multi-Oracle Aggregation with Outlier Rejection (#195)
+    pub fn aggregate_project_reports(
+        env: Env,
+        caller: Address,
+        project_id: BytesN<32>,
+        period_start: u64,
+        period_end: u64,
+        nonce: u64,
+    ) -> Result<i128, OracleError> {
+        caller.require_auth();
+        let expected_nonce = get_nonce(&env, &caller);
+        if nonce != expected_nonce {
+            return Err(OracleError::InvalidNonce);
+        }
+        set_nonce(&env, &caller, expected_nonce + 1);
+
+        let min_quorum = Self::get_minimum_quorum(env.clone());
+        let report_ids: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProjectReports(project_id.clone()))
+            .unwrap_or(vec![&env]);
+
+        let mut values: Vec<i128> = vec![&env];
+        let mut report_providers: Vec<(u64, Address, i128)> = vec![&env];
+
+        for rid in report_ids.iter() {
+            if let Some(r) = env
+                .storage()
+                .instance()
+                .get::<_, Report>(&DataKey::Report(rid))
+            {
+                if r.period_start == period_start && r.period_end == period_end {
+                    if let Some(p) = env
+                        .storage()
+                        .instance()
+                        .get::<_, OracleProvider>(&DataKey::Provider(r.provider.clone()))
+                    {
+                        if p.active {
+                            values.push_back(r.carbon_sequestered);
+                            report_providers.push_back((
+                                rid,
+                                r.provider.clone(),
+                                r.carbon_sequestered,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        if values.len() < min_quorum {
+            return Err(OracleError::InsufficientQuorum);
+        }
+
+        let n = values.len();
+        let mut arr = vec![&env];
+        for v in values.iter() {
+            arr.push_back(v);
+        }
+        for i in 0..n {
+            let mut min_idx = i;
+            for j in (i + 1)..n {
+                if arr.get(j).unwrap() < arr.get(min_idx).unwrap() {
+                    min_idx = j;
+                }
+            }
+            if min_idx != i {
+                let tmp_i = arr.get(i).unwrap();
+                let tmp_m = arr.get(min_idx).unwrap();
+                arr.set(i, tmp_m);
+                arr.set(min_idx, tmp_i);
+            }
+        }
+
+        let aggregate_score: i128 = if n == 2 {
+            (arr.get(0).unwrap() + arr.get(1).unwrap()) / 2
+        } else if n == 3 {
+            arr.get(1).unwrap()
+        } else if n > 3 {
+            let mut sum: i128 = 0;
+            let mut count: i128 = 0;
+            for idx in 1..(n - 1) {
+                sum += arr.get(idx).unwrap();
+                count += 1;
+            }
+            sum / count
+        } else {
+            arr.get(0).unwrap()
+        };
+
+        for item in report_providers.iter() {
+            let (rid, provider, val) = item;
+            let diff = (val - aggregate_score).abs();
+            let deviation_bps = if aggregate_score > 0 {
+                (diff * 10_000) / aggregate_score
+            } else {
+                0
+            };
+            if deviation_bps > MAX_ALLOWED_DEVIATION_BPS {
+                let _ = slash_provider(&env, &provider, rid);
+            }
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "oracle_aggregated"),),
+            (project_id, period_start, period_end, aggregate_score),
+        );
+
+        Ok(aggregate_score)
+    }
+
+    // Dispute Bond & Project Freeze (#193)
+    pub fn set_minimum_dispute_bond(
+        env: Env,
+        caller: Address,
+        bond_amount: i128,
+        nonce: u64,
+    ) -> Result<(), OracleError> {
+        caller.require_auth();
+        let expected_nonce = get_nonce(&env, &caller);
+        if nonce != expected_nonce {
+            return Err(OracleError::InvalidNonce);
+        }
+        set_nonce(&env, &caller, expected_nonce + 1);
+        require_admin(&env, &caller)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::MinimumDisputeBond, &bond_amount);
+        Ok(())
+    }
+
+    pub fn get_minimum_dispute_bond(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MinimumDisputeBond)
+            .unwrap_or(DEFAULT_MIN_DISPUTE_BOND)
+    }
+
+    pub fn is_project_disputed(env: Env, project_id: BytesN<32>) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::ProjectDisputed(project_id))
+            .unwrap_or(false)
+    }
+
+    // Oracle Staleness Config & State (#192)
+    pub fn set_project_staleness_config(
+        env: Env,
+        caller: Address,
+        project_id: BytesN<32>,
+        threshold1_secs: u64,
+        threshold2_secs: u64,
+        conservatism_discount_bps: u64,
+        nonce: u64,
+    ) -> Result<(), OracleError> {
+        caller.require_auth();
+        let expected_nonce = get_nonce(&env, &caller);
+        if nonce != expected_nonce {
+            return Err(OracleError::InvalidNonce);
+        }
+        set_nonce(&env, &caller, expected_nonce + 1);
+        require_admin(&env, &caller)?;
+
+        let config = ProjectStalenessConfig {
+            threshold1_secs,
+            threshold2_secs,
+            conservatism_discount_bps,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::ProjectStalenessConfig(project_id), &config);
+        Ok(())
+    }
+
+    pub fn get_project_staleness_config(
+        env: Env,
+        project_id: BytesN<32>,
+    ) -> ProjectStalenessConfig {
+        env.storage()
+            .instance()
+            .get(&DataKey::ProjectStalenessConfig(project_id))
+            .unwrap_or(ProjectStalenessConfig {
+                threshold1_secs: 604_800,
+                threshold2_secs: 2_592_000,
+                conservatism_discount_bps: 1_000,
+            })
+    }
+
+    pub fn get_project_staleness_state(
+        env: Env,
+        project_id: BytesN<32>,
+        current_timestamp: u64,
+    ) -> StalenessState {
+        let config = Self::get_project_staleness_config(env.clone(), project_id.clone());
+        let last_report_opt: Option<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProjectLastVerifiedAt(project_id.clone()));
+
+        let (last_report, elapsed) = match last_report_opt {
+            Some(ts) => (ts, current_timestamp.saturating_sub(ts)),
+            None => (0, 0),
+        };
+
+        let (tier, discount) = if last_report_opt.is_none() || elapsed < config.threshold1_secs {
+            (0u32, 0u64)
+        } else if elapsed < config.threshold2_secs {
+            (1u32, config.conservatism_discount_bps)
+        } else {
+            (2u32, 10_000u64)
+        };
+
+        StalenessState {
+            project_id,
+            last_report_timestamp: last_report,
+            current_tier: tier,
+            time_elapsed: elapsed,
+            discount_bps: discount,
+        }
     }
 
     pub fn get_provider(env: Env, provider: Address) -> Result<OracleProvider, OracleError> {
@@ -976,7 +1293,11 @@ fn slash_provider(env: &Env, provider: &Address, report_id: u64) -> Result<(), O
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn preview_slash(env: &Env, provider: &Address, report_id: u64) -> Result<SlashPreview, OracleError> {
+pub fn preview_slash(
+    env: &Env,
+    provider: &Address,
+    report_id: u64,
+) -> Result<SlashPreview, OracleError> {
     let p: OracleProvider = env
         .storage()
         .instance()
@@ -1391,8 +1712,12 @@ mod test {
 
         client.verify_report(&admin, &report_id, &1);
 
+        // The report is still Pending: one qualifying verification does not meet
+        // DEFAULT_SIGNATURE_THRESHOLD. The provider re-verifying its own report is
+        // therefore rejected as InvalidSignature, per oracle-design.md: "A provider
+        // cannot verify its own report".
         let result = client.try_verify_report(&provider, &report_id, &1);
-        assert_eq!(result, Err(Ok(OracleError::ReportAlreadyVerified)));
+        assert_eq!(result, Err(Ok(OracleError::InvalidSignature)));
     }
 
     #[test]
@@ -2420,10 +2745,10 @@ mod test {
         let project_id = create_project_id(&env, 1);
         let contract_id = env.register(OracleConsumer, (admin.clone(),));
         let client = OracleConsumerClient::new(&env, &contract_id);
-        
+
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra"), &0);
         client.add_stake(&provider, &50000, &0);
-        
+
         let report_id = client.submit_report(
             &provider,
             &project_id,
@@ -2433,22 +2758,25 @@ mod test {
             &BiodiversityMetrics::Absent,
             &Symbol::new(&env, "verra"),
             &make_ipfs_hash(&env, 1),
-            &1
+            &1,
         );
-        
+
         client.set_signature_threshold(&admin, &1u32, &1);
         client.verify_report(&admin, &report_id, &2);
-        
+
         let report_verified = client.get_report(&report_id);
         assert_eq!(report_verified.provider_stake_at_verification, Some(50000));
-        
+
         // Stake change/slash after verification
         client.slash_provider(&admin, &provider, &report_id, &3);
         let p_after = client.get_provider(&provider);
         assert_eq!(p_after.stake, 50000 - (50000 * SLASH_PENALTY_PPM / 1_000_000));
         
         let report_after_slash = client.get_report(&report_id);
-        assert_eq!(report_after_slash.provider_stake_at_verification, Some(50000));
+        assert_eq!(
+            report_after_slash.provider_stake_at_verification,
+            Some(50000)
+        );
         assert_eq!(report_after_slash.status, ReportStatus::Verified);
     }
 
@@ -2479,7 +2807,7 @@ mod test {
             &1,
         );
 
-        let preview = client.preview_slash(&report_id, &0);
+        let preview = client.preview_slash(&provider, &report_id);
         assert_eq!(preview.report_id, report_id);
         assert_eq!(preview.current_stake, 50000);
         assert_eq!(preview.penalty, 5000); // 10% of 50000
@@ -2540,6 +2868,8 @@ mod test {
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
         client.add_stake(&provider, &50000, &0);
 
+        // Submit while the provider is still active: an inactive provider cannot
+        // submit (Unauthorized), so the report has to exist before removal.
         let report_id = client.submit_report(
             &provider,
             &project_id,
@@ -2575,7 +2905,132 @@ mod test {
         client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
 
         // Try preview with non-existent report ID
-        let result = client.try_preview_slash(&999, &0);
+        let result = client.try_preview_slash(&provider, &999);
         assert_eq!(result, Err(Ok(OracleError::ReportNotFound)));
+    }
+
+    #[test]
+    fn test_minimum_quorum_and_aggregation() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.set_signature_threshold(&admin, &1, &0);
+        client.set_minimum_quorum(&admin, &2, &1);
+        assert_eq!(client.get_minimum_quorum(), 2);
+
+        let provider1 = Address::generate(&env);
+        let provider2 = Address::generate(&env);
+
+        client.register_provider(&admin, &provider1, &Symbol::new(&env, "verra_vcs"), &2);
+        client.register_provider(&admin, &provider2, &Symbol::new(&env, "satellite"), &3);
+
+        client.add_stake(&provider1, &100_000, &0);
+        client.add_stake(&provider2, &100_000, &0);
+
+        let r1 = client.submit_report(
+            &provider1,
+            &project_id,
+            &1000,
+            &2000,
+            &100,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 1),
+            &1,
+        );
+        let r2 = client.submit_report(
+            &provider2,
+            &project_id,
+            &1000,
+            &2000,
+            &110,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "satellite"),
+            &make_ipfs_hash(&env, 2),
+            &1,
+        );
+
+        client.verify_report(&admin, &r1, &4);
+        client.verify_report(&admin, &r2, &5);
+
+        let score = client.aggregate_project_reports(&admin, &project_id, &1000, &2000, &6);
+        assert_eq!(score, 105);
+    }
+
+    #[test]
+    fn test_dispute_bond_and_freeze() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let challenger = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+
+        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.set_minimum_dispute_bond(&admin, &1_000, &0);
+        assert_eq!(client.get_minimum_dispute_bond(), 1_000);
+
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &1);
+        client.register_provider(&admin, &challenger, &Symbol::new(&env, "disputer"), &2);
+
+        let r1 = client.submit_report(
+            &provider,
+            &project_id,
+            &1000,
+            &2000,
+            &100,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 1),
+            &0,
+        );
+
+        client.verify_report(&admin, &r1, &3);
+
+        // Challenge with 0 bond fails
+        assert_eq!(
+            client.try_challenge_report(&challenger, &r1, &make_ipfs_hash(&env, 2), &0),
+            Err(Ok(OracleError::DisputeBondInsufficient))
+        );
+
+        // Add bond stake for challenger
+        client.add_stake(&challenger, &2_000, &0);
+        client.challenge_report(&challenger, &r1, &make_ipfs_hash(&env, 2), &1);
+
+        assert!(client.is_project_disputed(&project_id));
+
+        // Resolve challenge: bad faith disputer slashed (resolution = Verified, valid report)
+        client.resolve_challenge(&admin, &r1, &nbbs_shared::ReportStatus::Verified, &4);
+        assert!(!client.is_project_disputed(&project_id));
+    }
+
+    #[test]
+    fn test_staleness_config_and_state() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+
+        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.set_project_staleness_config(&admin, &project_id, &100, &500, &1000, &0);
+
+        let cfg = client.get_project_staleness_config(&project_id);
+        assert_eq!(cfg.threshold1_secs, 100);
+        assert_eq!(cfg.threshold2_secs, 500);
+        assert_eq!(cfg.conservatism_discount_bps, 1000);
+
+        let state = client.get_project_staleness_state(&project_id, &1000);
+        assert_eq!(state.current_tier, 0);
     }
 }

@@ -30,6 +30,9 @@ mod integration {
     fn make_bond_config(env: &Env, project_id: BytesN<32>, total_supply: i128) -> BondConfig {
         BondConfig {
             project_id,
+            credit_vintage: 2024,
+            serial_number_start: 1,
+            serial_number_end: 10_000,
             face_value: 1000,
             coupon_schedule: soroban_sdk::vec![env, 1_000_000u64, 2_000_000u64],
             credit_type: CreditType::Carbon,
@@ -86,7 +89,7 @@ mod integration {
     /// 2-verifier threshold: the admin (consuming `admin_nonce`) plus a
     /// freshly registered, staked provider (consuming `admin_nonce + 1` to
     /// register). The admin's signature alone is not enough to finalize a
-    /// report — see "Multi-Source Verification Threshold" in
+    /// report; see "Multi-Source Verification Threshold" in
     /// docs/oracle-design.md.
     fn verify_with_quorum(
         _env: &Env,
@@ -172,7 +175,7 @@ mod integration {
             assert!(result.total_credits > 0);
             assert_eq!(result.holder_count, 1);
 
-            let accrued = contracts.ce_client.accrued_credits(&bond_id, &bob);
+            let accrued = contracts.ce_client.escrowed_credits(&bond_id, &bob);
             assert!(accrued > 0);
 
             let credit_hash = make_ipfs_hash(&env, 42);
@@ -322,6 +325,9 @@ mod integration {
                 credit_type: CreditType::BlueCarbon,
                 maturity_date: 3_000_000,
                 total_supply: 10_000,
+            credit_vintage: 2024,
+            serial_number_start: 1,
+            serial_number_end: 10_000,
             };
             let bond_id = contracts.bi_client.issue_bond(&admin, &config, &0);
             assert_eq!(bond_id, 1);
@@ -371,7 +377,7 @@ mod integration {
             assert!(result.total_credits > 0);
             assert_eq!(result.holder_count, 1);
 
-            let accrued = contracts.ce_client.accrued_credits(&bond_id, &bob);
+            let accrued = contracts.ce_client.escrowed_credits(&bond_id, &bob);
             assert!(accrued > 0);
 
             let credit_hash = make_ipfs_hash(&env, 42);
@@ -639,7 +645,7 @@ mod integration {
                 &1,
             );
 
-            contracts.oc_client.verify_report(&admin, &report_id, &2);
+            verify_with_quorum(&env, &contracts.oc_client, &admin, report_id, 2);
             assert_eq!(
                 contracts.oc_client.get_report(&report_id).status,
                 ReportStatus::Verified
@@ -670,11 +676,11 @@ mod integration {
             let blocked = contracts
                 .ce_client
                 .try_distribute_coupon(&admin, &bond_id, &1, &holders, &report_id, &2);
-            assert_eq!(blocked, Err(Ok(BondError::ReportNotVerified)));
+            assert_eq!(blocked, Err(Ok(BondError::ProjectDisputedAndFrozen)));
 
             contracts
                 .oc_client
-                .resolve_challenge(&admin, &report_id, &ReportStatus::Verified, &3);
+                .resolve_challenge(&admin, &report_id, &ReportStatus::Verified, &4);
             assert_eq!(
                 contracts.oc_client.get_report(&report_id).status,
                 ReportStatus::Verified
@@ -693,6 +699,38 @@ mod integration {
 
     mod dex {
         use super::*;
+
+        fn configure_market(
+            env: &Env,
+            contracts: &TestContracts,
+            admin: &Address,
+            bond_id: u64,
+            price: i128,
+        ) {
+            let quote_asset = Symbol::new(env, "USDC");
+            contracts.dr_client.configure_market(
+                admin,
+                &bond_id,
+                &quote_asset,
+                &1,
+                &10_000,
+                &10_000,
+                &10_000,
+                &i128::MAX,
+                &3_600,
+                &60,
+                &0,
+            );
+            contracts.dr_client.update_oracle_reference(
+                admin,
+                &bond_id,
+                &quote_asset,
+                &price,
+                &env.ledger().timestamp(),
+                &1,
+                &1,
+            );
+        }
 
         #[test]
         fn test_full_settlement_with_seller_withdrawal() {
@@ -718,6 +756,7 @@ mod integration {
             let config = make_bond_config(&env, project_id, 10_000);
             let bond_id = contracts.bi_client.issue_bond(&admin, &config, &0);
             contracts.bi_client.subscribe(&alice, &bond_id, &5_000, &0);
+            configure_market(&env, &contracts, &admin, bond_id, 100);
 
             let order_id = contracts.dr_client.list_bond_tokens(
                 &alice,
@@ -792,6 +831,7 @@ mod integration {
             let config = make_bond_config(&env, project_id, 10_000);
             let bond_id = contracts.bi_client.issue_bond(&admin, &config, &0);
             contracts.bi_client.subscribe(&alice, &bond_id, &5_000, &0);
+            configure_market(&env, &contracts, &admin, bond_id, 100);
 
             let order_id = contracts.dr_client.list_bond_tokens(
                 &alice,
@@ -840,6 +880,7 @@ mod integration {
             let config = make_bond_config(&env, project_id, 10_000);
             let bond_id = contracts.bi_client.issue_bond(&admin, &config, &0);
             contracts.bi_client.subscribe(&alice, &bond_id, &5_000, &0);
+            configure_market(&env, &contracts, &admin, bond_id, 100);
 
             let order_id = contracts.dr_client.list_bond_tokens(
                 &alice,
@@ -895,6 +936,7 @@ mod integration {
             let config = make_bond_config(&env, project_id, 10_000);
             let bond_id = contracts.bi_client.issue_bond(&admin, &config, &0);
             contracts.bi_client.subscribe(&alice, &bond_id, &5_000, &0);
+            configure_market(&env, &contracts, &admin, bond_id, 100);
 
             let order_id = contracts.dr_client.list_bond_tokens(
                 &alice,
@@ -1043,9 +1085,8 @@ mod integration {
                 .distribute_coupon(&admin, &bond_id, &0, &holders, &report_id, &1);
 
             let total = 100 * nbbs_coupon_engine::CREDIT_MINOR_UNITS;
-            let credits_per_token =
-                total * nbbs_coupon_engine::FIXED_POINT / 3;
-            let per_holder = credits_per_token * 1 / nbbs_coupon_engine::FIXED_POINT;
+            // each holder holds 1 token
+            let per_holder = total / 3;
             let distributed = per_holder * 3;
 
             assert_eq!(result.total_credits, distributed);
@@ -1056,7 +1097,9 @@ mod integration {
                 total - distributed
             );
 
-            let swept = contracts.ce_client.sweep_undistributed(&admin, &bond_id, &2);
+            let swept = contracts
+                .ce_client
+                .sweep_undistributed(&admin, &bond_id, &2);
             assert_eq!(swept, total - distributed);
             assert_eq!(contracts.ce_client.get_undistributed_total(&bond_id), 0);
         }
@@ -1236,16 +1279,13 @@ mod integration {
                 * nbbs_coupon_engine::CREDIT_MINOR_UNITS
                 / nbbs_coupon_engine::HABITAT_CREDIT_RATE;
 
-            contracts.ce_client.register_bond(&admin, &bond_id, &project_id, &0);
+            contracts
+                .ce_client
+                .register_bond(&admin, &bond_id, &project_id, &0);
             let holders = soroban_sdk::vec![&env, holder.clone()];
-            contracts.ce_client.distribute_coupon(
-                &admin,
-                &bond_id,
-                &0,
-                &holders,
-                &report_0,
-                &1,
-            );
+            contracts
+                .ce_client
+                .distribute_coupon(&admin, &bond_id, &0, &holders, &report_0, &1);
 
             let report_1 = contracts.oc_client.submit_report(
                 &oracle,
@@ -1268,14 +1308,9 @@ mod integration {
                 / nbbs_coupon_engine::HABITAT_CREDIT_RATE;
 
             let holder_vec = soroban_sdk::vec![&env, holder.clone()];
-            contracts.ce_client.distribute_coupon(
-                &admin,
-                &bond_id,
-                &1,
-                &holder_vec,
-                &report_1,
-                &2,
-            );
+            contracts
+                .ce_client
+                .distribute_coupon(&admin, &bond_id, &1, &holder_vec, &report_1, &2);
 
             let expected_total = carbon_0 + bio_0 + carbon_1 + bio_1;
             assert_eq!(
@@ -1283,7 +1318,9 @@ mod integration {
                 expected_total
             );
 
-            let details = contracts.ce_client.claimable_credit_details(&bond_id, &holder);
+            let details = contracts
+                .ce_client
+                .claimable_credit_details(&bond_id, &holder);
             assert_eq!(details.len(), 4);
 
             let line = details.get(0).unwrap();
@@ -1318,7 +1355,10 @@ mod integration {
             assert_eq!(claimed, expected_total);
             assert_eq!(contracts.ce_client.claimable_credits(&bond_id, &holder), 0);
             assert_eq!(
-                contracts.ce_client.claimable_credit_details(&bond_id, &holder).len(),
+                contracts
+                    .ce_client
+                    .claimable_credit_details(&bond_id, &holder)
+                    .len(),
                 0
             );
         }
@@ -1338,9 +1378,112 @@ mod integration {
 
             assert_eq!(contracts.ce_client.claimable_credits(&bond_id, &holder), 0);
             assert_eq!(
-                contracts.ce_client.claimable_credit_details(&bond_id, &holder).len(),
+                contracts
+                    .ce_client
+                    .claimable_credit_details(&bond_id, &holder)
+                    .len(),
                 0
             );
+        }
+    }
+
+    mod governance {
+        use super::*;
+        use nbbs_governance::{Governance, GovernanceClient, DEFAULT_TIMELOCK_SECONDS};
+        use soroban_sdk::IntoVal;
+
+        // Role granting is governance-gated exactly when each contract's admin
+        // is the governance contract. This walks that configuration for every
+        // admin-bearing contract: hand the role to governance, then rotate it
+        // again only through a threshold-approved, timelocked proposal. It also
+        // pins the calling convention `execute` relies on: every admin method
+        // takes the caller first and a nonce last, `set_admin` included.
+        #[test]
+        fn test_governance_rotates_admin_on_every_contract() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let admin = Address::generate(&env);
+            let contracts = deploy_contracts(&env, &admin);
+
+            let signers = soroban_sdk::vec![
+                &env,
+                Address::generate(&env),
+                Address::generate(&env),
+                Address::generate(&env)
+            ];
+            let threshold: u32 = 2;
+            let gov_addr = env.register(
+                Governance,
+                (&signers, &threshold, &DEFAULT_TIMELOCK_SECONDS),
+            );
+            let gov = GovernanceClient::new(&env, &gov_addr);
+            let method = Symbol::new(&env, "set_admin");
+            let proposer = signers.get(0).unwrap();
+            let voter = signers.get(1).unwrap();
+            let allower = signers.get(2).unwrap();
+
+            // Every contract's admin nonce is independent, so each hand-over is
+            // that admin's first call on that contract.
+            contracts.pr_client.set_admin(&admin, &gov_addr, &0);
+            contracts.bi_client.set_admin(&admin, &gov_addr, &0);
+            contracts.oc_client.set_admin(&admin, &gov_addr, &0);
+            contracts.ce_client.set_admin(&admin, &gov_addr, &0);
+            contracts.dr_client.set_admin(&admin, &gov_addr, &0);
+            contracts.cr_client.set_admin(&admin, &gov_addr, &0);
+
+            let targets = [
+                contracts.pr_client.address.clone(),
+                contracts.bi_client.address.clone(),
+                contracts.oc_client.address.clone(),
+                contracts.ce_client.address.clone(),
+                contracts.dr_client.address.clone(),
+                contracts.cr_client.address.clone(),
+            ];
+            let new_admin = Address::generate(&env);
+            let mut now = 0u64;
+            for (i, target) in targets.iter().enumerate() {
+                let i = i as u64;
+                gov.add_to_allow_list(&allower, target, &method, &(2 * i));
+                let proposal_id = gov.propose(
+                    &proposer,
+                    target,
+                    &method,
+                    &soroban_sdk::vec![&env, new_admin.clone().into_val(&env)],
+                    &Symbol::new(&env, "rotate"),
+                    &(2 * i),
+                );
+                gov.vote_approve(&voter, &proposal_id, &i);
+                // One vote short of the threshold: nothing may execute yet.
+                assert!(gov
+                    .try_execute(&proposer, &proposal_id, &(2 * i + 1))
+                    .is_err());
+                gov.vote_approve(&allower, &proposal_id, &(2 * i + 1));
+                // Queued, but the timelock has not elapsed.
+                assert!(gov
+                    .try_execute(&proposer, &proposal_id, &(2 * i + 1))
+                    .is_err());
+
+                now += DEFAULT_TIMELOCK_SECONDS;
+                env.ledger().set_timestamp(now);
+                gov.execute(&proposer, &proposal_id, &(2 * i + 1));
+            }
+
+            assert_eq!(contracts.pr_client.get_admin(), new_admin);
+            assert_eq!(contracts.bi_client.get_admin(), new_admin);
+            assert_eq!(contracts.oc_client.get_admin(), new_admin);
+            assert_eq!(contracts.ce_client.get_admin(), new_admin);
+            assert_eq!(contracts.dr_client.get_admin(), new_admin);
+            assert_eq!(contracts.cr_client.get_admin(), new_admin);
+
+            // Neither the original key nor governance itself holds the role now.
+            assert!(contracts
+                .bi_client
+                .try_set_admin(&admin, &Address::generate(&env), &1)
+                .is_err());
+            assert!(contracts
+                .bi_client
+                .try_set_admin(&gov_addr, &Address::generate(&env), &1)
+                .is_err());
         }
     }
 
@@ -1397,6 +1540,7 @@ mod integration {
                     .bi_client
                     .subscribe(&alice, &bond_id, &order_amount, &0);
 
+                configure_market(&env, &contracts, &admin, bond_id, price);
                 let quote = Symbol::new(&env, "USDC");
                 let order_id = contracts.dr_client.list_bond_tokens(
                     &alice,
@@ -1530,13 +1674,15 @@ mod integration {
 
                 let mut distributed = 0i128;
                 for (holder, &amount) in holders.iter().zip(balances.iter()) {
+                    let expected = total_credits * amount / total_subscribed;
+                    let accrued = contracts.ce_client.accrued_credits(&bond_id, holder);
                     let cpt = if total_credits > 0 {
                         total_credits * nbbs_coupon_engine::FIXED_POINT / total_subscribed
                     } else {
                         0
                     };
                     let expected = cpt * amount / nbbs_coupon_engine::FIXED_POINT;
-                    let accrued = contracts.ce_client.accrued_credits(&bond_id, holder);
+                    let accrued = contracts.ce_client.escrowed_credits(&bond_id, holder);
                     prop_assert_eq!(accrued, expected);
                     distributed += expected;
                 }
@@ -1671,17 +1817,24 @@ mod integration {
             );
             contracts.oc_client.verify_report(&admin, &report_id, &1);
 
-            contracts.ce_client.register_bond(&admin, &bond_id, &project_id, &0);
-
-            let holders = soroban_sdk::vec![&env, bob.clone(), charlie.clone()];
-            let dist_result = contracts.ce_client.distribute_coupon(
+            // DEFAULT_SIGNATURE_THRESHOLD is 2, so a second independently staked
+            // verifier is needed before the report reaches Verified and the coupon
+            // can be distributed.
+            let second_verifier = Address::generate(&env);
+            contracts.oc_client.register_provider(
                 &admin,
-                &bond_id,
-                &0,
-                &holders,
-                &report_id,
-                &1,
+                &second_verifier,
+                &Symbol::new(&env, "satellite"),
+                &2,
             );
+            contracts.oc_client.add_stake(
+                &second_verifier,
+                &nbbs_oracle_consumer::DEFAULT_MIN_VERIFIER_STAKE,
+                &0,
+            );
+            contracts
+                .oc_client
+                .verify_report(&second_verifier, &report_id, &1);
 
             let u = nbbs_coupon_engine::CREDIT_MINOR_UNITS;
             let bob_accrued = contracts.ce_client.accrued_credits(&bond_id, &bob);
@@ -1700,7 +1853,7 @@ mod integration {
                 &bond_id,
                 &(10 * u),
                 &CreditType::Carbon,
-                &credit_hash_1,
+                &make_ipfs_hash(&env, 42),
                 &0,
             );
             
@@ -1715,7 +1868,7 @@ mod integration {
                 &bond_id,
                 &(bob_remaining + 1),
                 &CreditType::Carbon,
-                &credit_hash_2,
+                &make_ipfs_hash(&env, 43),
                 &1,
             );
             assert!(res.is_err());
@@ -1794,6 +1947,60 @@ mod integration {
             content.push('\n');
             std::fs::write(&fixture_path(), content).expect("write storage_keys.json");
             eprintln!("wrote {}", fixture_path().display());
+        }
+    }
+
+    // Issue #188: versioned-interface convention — every contract in the
+    // suite publishes its schema version so callers can gate interoperation.
+    mod schema_versions {
+        use super::*;
+        use nbbs_shared::CURRENT_SCHEMA_VERSION;
+
+        #[test]
+        fn all_contracts_publish_the_current_schema_version() {
+            let env = Env::default();
+            let admin = Address::generate(&env);
+
+            let issuer_id = env.register(BondIssuer, (admin.clone(),));
+            let registry_id = env.register(ProjectRegistry, (admin.clone(),));
+            let oracle_id = env.register(OracleConsumer, (admin.clone(),));
+            let coupon_id = env.register(
+                CouponEngine,
+                (admin.clone(), issuer_id.clone(), oracle_id.clone()),
+            );
+            let retirement_id = env.register(
+                CreditRetirement,
+                (admin.clone(), issuer_id.clone(), coupon_id.clone()),
+            );
+            let dex_id = env.register(
+                DEXRouter,
+                (admin.clone(), issuer_id.clone(), coupon_id.clone()),
+            );
+
+            assert_eq!(
+                CouponEngineClient::new(&env, &coupon_id).schema_version(),
+                CURRENT_SCHEMA_VERSION
+            );
+            assert_eq!(
+                BondIssuerClient::new(&env, &issuer_id).schema_version(),
+                CURRENT_SCHEMA_VERSION
+            );
+            assert_eq!(
+                ProjectRegistryClient::new(&env, &registry_id).schema_version(),
+                CURRENT_SCHEMA_VERSION
+            );
+            assert_eq!(
+                OracleConsumerClient::new(&env, &oracle_id).schema_version(),
+                CURRENT_SCHEMA_VERSION
+            );
+            assert_eq!(
+                CreditRetirementClient::new(&env, &retirement_id).schema_version(),
+                CURRENT_SCHEMA_VERSION
+            );
+            assert_eq!(
+                DEXRouterClient::new(&env, &dex_id).schema_version(),
+                CURRENT_SCHEMA_VERSION
+            );
         }
     }
 }
