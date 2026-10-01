@@ -43,31 +43,7 @@ pub struct BondState {
     pub created_at: u64,
 }
 
-#[derive(Clone, Debug)]
-#[contracttype]
-pub struct BalanceCheckpoint {
-    pub version: u64,
-    pub balance: i128,
-}
 
-#[derive(Clone, Debug)]
-#[contracttype]
-pub struct SupplyCheckpoint {
-    pub version: u64,
-    pub total_subscribed: i128,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-#[contracttype]
-pub struct PreviewSubscription {
-    pub remaining_supply: i128,
-    pub requested_amount: i128,
-    /// Discriminant of the `BondError` the caller would hit, if any.
-    /// Held as the raw code rather than `Option<BondError>`: `#[contracterror]`
-    /// types do not implement `SorobanArbitrary`, so embedding one in a
-    /// `#[contracttype]` fails to compile once `testutils` is enabled.
-    pub expected_failure: Option<u32>,
-}
 
 fn require_admin(env: &Env, caller: &Address) -> Result<(), BondError> {
     let admin: Address = env
@@ -1924,4 +1900,6 @@ mod test {
             }
         }
     }
+
+
 }
