@@ -10,15 +10,6 @@ use soroban_sdk::{
 /// layout or interface change; see docs/upgrade-migrations.md.
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// Bond held in quote-asset minor units while a purchase is committed.
-pub const PURCHASE_COMMIT_BOND: i128 = 1_000;
-/// A committed purchase must be revealed after one ledger and within twenty.
-pub const PURCHASE_REVEAL_DELAY: u32 = 1;
-pub const PURCHASE_REVEAL_WINDOW: u32 = 20;
-const MARKET_TTL_THRESHOLD: u32 = 1_000;
-const MARKET_TTL_EXTEND_TO: u32 = 518_400;
-const BASIS_POINTS: i128 = 10_000;
-
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {

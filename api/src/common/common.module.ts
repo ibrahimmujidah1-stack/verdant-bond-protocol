@@ -15,56 +15,24 @@ import { TelemetryService } from './services/telemetry.service';
 import { TelemetryInterceptor } from './interceptors/telemetry.interceptor';
 import { QuotaService } from './services/quota.service';
 import { QuotaGuard } from './guards/quota.guard';
-import { QuotaController } from './quota.controller';
 import { StellarModule } from '../stellar/stellar.module';
-import { ExternalReferenceVerifierService } from './services/external-reference-verifier.service';
-
-const SHARED = [
-  NonceService, RedisService, SigningKeyProvider, ConfigService, KycStoreService,
-  HolderIndexService, IntentService, IntentGuard, IdempotencyService,
-  SearchIndexService, EnvConfigValidator,
-  TelemetryService, TelemetryInterceptor, QuotaService, QuotaGuard,
-];
+import { QuotaController } from './quota.controller';
 
 @Global()
 @Module({
   imports: [StellarModule],
   controllers: [RedisHealthController, QuotaController],
   providers: [
-    NonceService,
-    RedisService,
-    SigningKeyProvider,
-    ConfigService,
-    KycStoreService,
-    HolderIndexService,
-    IntentService,
-    IntentGuard,
-    IdempotencyService,
-    SearchIndexService,
-    EnvConfigValidator,
-    TelemetryService,
-    TelemetryInterceptor,
-    QuotaService,
-    QuotaGuard,
-    ExternalReferenceVerifierService,
+    NonceService, RedisService, SigningKeyProvider, ConfigService, KycStoreService,
+    HolderIndexService, IntentService, IntentGuard, IdempotencyService,
+    SearchIndexService, EnvConfigValidator, TelemetryService, TelemetryInterceptor,
+    QuotaService, QuotaGuard
   ],
   exports: [
-    NonceService,
-    RedisService,
-    SigningKeyProvider,
-    ConfigService,
-    KycStoreService,
-    HolderIndexService,
-    IntentService,
-    IntentGuard,
-    IdempotencyService,
-    SearchIndexService,
-    EnvConfigValidator,
-    TelemetryService,
-    TelemetryInterceptor,
-    QuotaService,
-    QuotaGuard,
-    ExternalReferenceVerifierService,
+    NonceService, RedisService, SigningKeyProvider, ConfigService, KycStoreService,
+    HolderIndexService, IntentService, IntentGuard, IdempotencyService,
+    SearchIndexService, EnvConfigValidator, TelemetryService, TelemetryInterceptor,
+    QuotaService, QuotaGuard
   ],
 })
 export class CommonModule {}
