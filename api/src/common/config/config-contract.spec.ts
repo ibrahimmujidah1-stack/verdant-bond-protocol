@@ -153,6 +153,21 @@ describe('configuration contract (#352)', () => {
       expect(codes(env, 'staging')).toContain('INVESTOR_SECRET_KEY:SHARED_SIGNER');
     });
 
+    it('accepts a distinct intent receipt signing key and treats it as optional', () => {
+      const env = profile('production', 0);
+      expect(codes(env, 'production')).toEqual([]);
+      env.INTENT_RECEIPT_SIGNING_SECRET = key(90).secret();
+      expect(codes(env, 'production')).toEqual([]);
+    });
+
+    it('rejects an intent receipt signing key that is malformed or reuses an operator key', () => {
+      const env = profile('production', 0);
+      env.INTENT_RECEIPT_SIGNING_SECRET = 'not-a-seed';
+      expect(codes(env, 'production')).toContain('INTENT_RECEIPT_SIGNING_SECRET:INVALID_SECRET_SEED');
+      env.INTENT_RECEIPT_SIGNING_SECRET = env.ADMIN_SECRET_KEY;
+      expect(codes(env, 'production')).toContain('INTENT_RECEIPT_SIGNING_SECRET:SHARED_SIGNER');
+    });
+
     it('rejects malformed secret seeds', () => {
       expect(codes({ ...profile('development', 0), USER_SECRET_KEY: 'S...' }, 'development')).toContain(
         'USER_SECRET_KEY:INVALID_SECRET_SEED',

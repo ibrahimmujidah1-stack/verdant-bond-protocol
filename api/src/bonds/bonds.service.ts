@@ -1,7 +1,3 @@
-import { Injectable, BadRequestException } from '@nestjs/common';
-import { ContractService } from '../stellar/contract.service';
-import { ContractException } from '../stellar/contract-errors';
-import { StellarService } from '../stellar/stellar.service';
 import { Injectable, BadRequestException, ForbiddenException, Optional } from '@nestjs/common';
 import { ContractService } from '../stellar/contract.service';
 import { ContractException } from '../stellar/contract-errors';
@@ -17,6 +13,7 @@ import { HolderIndexService } from './holder-index.service';
 import { CreateBondDto } from './dto/create-bond.dto';
 import { SubscribeDto } from './dto/subscribe.dto';
 import { DistributeCouponDto } from './dto/distribute-coupon.dto';
+import { DistributeCouponBatchDto } from './dto/distribute-coupon-batch.dto';
 import { ClaimCreditsDto } from './dto/claim-credits.dto';
 import { TransferBondDto } from './dto/transfer-bond.dto';
 import { nativeToScVal, scValToNative, Address, xdr } from '@stellar/stellar-sdk';
@@ -28,6 +25,8 @@ import {
   SubscriptionResponse,
   HolderListResponse,
   CouponDistributionResponse,
+  CouponBatchStatusResponse,
+  CouponBatchDistributionResponse,
   ClaimCreditsResponse,
   ClaimableCreditsResponse,
   TransferResponse,
@@ -36,22 +35,13 @@ import {
   BondStatusEnum,
   BondMaturityStatusEnum,
   CreditTypeEnum,
-  TransferResponse,
-  UndistributedTotalResponse,
-  SweepUndistributedResponse,
-  BondDetailResponse,
-  BondStatusEnum,
-  BondMaturityStatusEnum,
-  CreditTypeEnum,
   ClaimableCreditDetail,
-  ClaimableCreditsResponse,
 } from './interfaces/bond.interface';
 import { toBigIntString } from '../common/utils';
 import { ConfigService } from '../config/config.service';
 import { OracleService } from '../oracle/oracle.service';
 import { ReportStatus } from '../oracle/interfaces/oracle.interface';
 
-import { Optional } from '@nestjs/common';
 
 const BOND_ERROR_CODE = {
   NotInitialized: 1,
@@ -186,7 +176,6 @@ export class BondsService {
     const investorSecret = this.signingKeys.investorSecret();
     await this.verifySubscriptionEligibility(id, dto);
 
-    const investorSecret = this.signingKeys.investorSecret();
     const nonce = await this.nonceService.next(this.configService.getBondIssuerAddress(), dto.investorAddress);
     const { transactionHash } = await this.contractService.invokeContractMethod(
       this.configService.getBondIssuerAddress(), 'subscribe', investorSecret,
@@ -209,21 +198,6 @@ export class BondsService {
     return { bondId: id, investorAddress: dto.investorAddress, amount: toBigIntString(dto.amount), transactionHash: transactionHash || '' };
   }
 
-  async previewSubscribe(id: number, amount: number): Promise<{remaining_supply: number; requested_amount: number; expected_failure: string | null}> {
-    const bond = await this.findOne(id);
-    let expected_failure = null;
-    const remaining_supply = Number(bond.totalSupply) - Number(bond.totalSubscribed);
-    if (bond.status !== BondStatusEnum.Active) {
-      expected_failure = 'Bond is not active';
-    } else if (remaining_supply < amount) {
-      expected_failure = 'Insufficient supply';
-    }
-    return {
-      remaining_supply,
-      requested_amount: Number(amount),
-      expected_failure
-    };
-  }
   private async verifySubscriptionEligibility(bondId: number, dto: SubscribeDto): Promise<void> {
     const isRestrictedTranche = dto.tranche === TrancheType.RESTRICTED_ACCREDITED;
 
@@ -323,17 +297,72 @@ export class BondsService {
     };
   }
 
-  async distributeCoupon(id: number, dto: DistributeCouponDto): Promise<CouponDistributionResponse> {
+  /** Maximum batch size per transaction to guarantee staying within Soroban CPU/resource limits. */
+  static readonly MAX_SAFE_BATCH_SIZE = 50;
+
+  async getCouponBatchStatus(bondId: number, periodIndex: number): Promise<CouponBatchStatusResponse> {
+    const holderAddresses = await this.holderIndex.getHoldersForCoupon(bondId, { requireFresh: false });
+    const totalHolders = holderAddresses.length;
+
+    try {
+      const infoRaw = await this.contractService.simulateCall({
+        contractAddress: this.configService.getCouponEngineAddress(),
+        method: 'get_period_info',
+        args: [
+          nativeToScVal(BigInt(bondId), { type: 'u64' }),
+          nativeToScVal(periodIndex, { type: 'u32' }),
+        ],
+      });
+      const info = scValToNative(infoRaw) as any[];
+      // PeriodInfo: [period_index, start_time, end_time, total_credits_earned, distributed, report_id, undistributed]
+      const totalCreditsEarned = toBigIntString(info?.[3] ?? 0);
+      const distributed = Boolean(info?.[4]);
+      const undistributed = toBigIntString(info?.[6] ?? 0);
+      const cursor = distributed ? totalHolders : 0;
+
+      return {
+        bondId,
+        periodIndex,
+        cursor,
+        totalHolders,
+        distributed,
+        totalCreditsEarned,
+        undistributed,
+        remainingHolders: Math.max(0, totalHolders - cursor),
+      };
+    } catch {
+      return {
+        bondId,
+        periodIndex,
+        cursor: 0,
+        totalHolders,
+        distributed: false,
+        totalCreditsEarned: '0',
+        undistributed: '0',
+        remainingHolders: totalHolders,
+      };
+    }
+  }
+
+  async distributeCouponBatch(
+    id: number,
+    dto: DistributeCouponBatchDto,
+  ): Promise<CouponBatchDistributionResponse> {
     const adminSecret = this.getAdminSecret();
     const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
     const nonce = await this.nonceService.next(this.configService.getCouponEngineAddress(), adminAddress);
 
+    if (dto.limit > 100) {
+      throw new BadRequestException('Batch limit exceeds maximum allowed limit of 100');
+    }
+
     const holderAddresses = await this.holderIndex.getHoldersForCoupon(id, { requireFresh: true });
-    // Challenge linkage (#oracle-challenge): a coupon pays out on the carbon
-    // data in the referenced oracle report. If that report is Challenged or
-    // Rejected, the data is disputed and must not be paid on, so block before
-    // any contract call is made. The oracle dependency is optional so the bond
-    // module keeps working where the oracle module is not wired in.
+    if (dto.offset > holderAddresses.length) {
+      throw new BadRequestException(
+        `Batch offset ${dto.offset} exceeds total holder count ${holderAddresses.length}`,
+      );
+    }
+
     if (this.oracleService) {
       const report = await this.oracleService.getReport(dto.reportId);
       if (report.status === ReportStatus.Challenged) {
@@ -347,10 +376,114 @@ export class BondsService {
       }
     }
 
+    const effectiveLimit = Math.min(dto.limit, holderAddresses.length - dto.offset);
 
+    const { result, transactionHash } = await this.contractService.invokeContractMethod(
+      this.configService.getCouponEngineAddress(),
+      'distribute_coupon_batch',
+      adminSecret,
+      [
+        Address.fromString(adminAddress).toScVal(),
+        nativeToScVal(BigInt(id), { type: 'u64' }),
+        nativeToScVal(dto.periodIndex, { type: 'u32' }),
+        xdr.ScVal.scvVec(holderAddresses.map((h) => Address.fromString(h).toScVal())),
+        nativeToScVal(BigInt(dto.reportId), { type: 'u64' }),
+        nativeToScVal(dto.offset, { type: 'u32' }),
+        nativeToScVal(effectiveLimit, { type: 'u32' }),
+        nativeToScVal(BigInt(nonce), { type: 'u64' }),
+      ],
+      adminAddress,
+    );
 
-    const { result } = await this.contractService.invokeContractMethod(
-      this.configService.getCouponEngineAddress(), 'distribute_coupon', adminSecret,
+    const parsed = scValToNative(result) as any[];
+    const processedCredits = toBigIntString(parsed?.[2] ?? 0);
+    const newCursor = dto.offset + effectiveLimit;
+    const batchComplete = newCursor >= holderAddresses.length;
+
+    if (batchComplete) {
+      await this.complianceSnapshots?.capture(
+        `bond:${id}:coupon:${dto.periodIndex}`,
+        'COUPON_DISTRIBUTED',
+        id,
+        {
+          periodIndex: dto.periodIndex,
+          reportId: dto.reportId,
+          holderAddresses,
+          totalCredits: processedCredits,
+          transactionHash,
+        },
+      );
+    }
+
+    return {
+      bondId: id,
+      periodIndex: dto.periodIndex,
+      offset: dto.offset,
+      limit: effectiveLimit,
+      processedCount: effectiveLimit,
+      cursor: newCursor,
+      batchComplete,
+      totalCredits: processedCredits,
+      transactionHash: transactionHash ?? '',
+    };
+
+  }
+
+  async distributeCoupon(id: number, dto: DistributeCouponDto): Promise<CouponDistributionResponse> {
+    const adminSecret = this.getAdminSecret();
+    const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
+
+    const holderAddresses = await this.holderIndex.getHoldersForCoupon(id, { requireFresh: true });
+
+    if (this.oracleService) {
+      const report = await this.oracleService.getReport(dto.reportId);
+      if (report.status === ReportStatus.Challenged) {
+        throw new BadRequestException(
+          `Cannot distribute coupon: report ${report.id} is currently Challenged. ` +
+            'Resolve the challenge before distributing.',
+        );
+      }
+      if (report.status === ReportStatus.Rejected) {
+        throw new BadRequestException(`Cannot distribute coupon: report ${report.id} was Rejected.`);
+      }
+    }
+
+    if (holderAddresses.length > BondsService.MAX_SAFE_BATCH_SIZE) {
+      let offset = 0;
+      let totalCredits = 0n;
+      let lastTxHash = '';
+
+      while (offset < holderAddresses.length) {
+        const batchLimit = Math.min(
+          BondsService.MAX_SAFE_BATCH_SIZE,
+          holderAddresses.length - offset,
+        );
+        const batchResult = await this.distributeCouponBatch(id, {
+          periodIndex: dto.periodIndex,
+          reportId: dto.reportId,
+          offset,
+          limit: batchLimit,
+        });
+
+        offset = batchResult.cursor;
+        lastTxHash = batchResult.transactionHash;
+        totalCredits = BigInt(batchResult.totalCredits);
+      }
+
+      return {
+        bondId: id,
+        periodIndex: dto.periodIndex,
+        totalCredits: totalCredits.toString(),
+        holderCount: holderAddresses.length,
+      };
+    }
+
+    const nonce = await this.nonceService.next(this.configService.getCouponEngineAddress(), adminAddress);
+
+    const { result, transactionHash } = await this.contractService.invokeContractMethod(
+      this.configService.getCouponEngineAddress(),
+      'distribute_coupon',
+      adminSecret,
       [
         Address.fromString(adminAddress).toScVal(),
         nativeToScVal(BigInt(id), { type: 'u64' }),
@@ -362,9 +495,18 @@ export class BondsService {
     );
 
     const parsed = scValToNative(result) as any[];
-    await this.complianceSnapshots?.capture(`bond:${id}:coupon:${dto.periodIndex}`, 'COUPON_DISTRIBUTED', id,
-      { periodIndex: dto.periodIndex, reportId: dto.reportId, holderAddresses,
-        totalCredits: toBigIntString(parsed?.[2] ?? 0), transactionHash });
+    await this.complianceSnapshots?.capture(
+      `bond:${id}:coupon:${dto.periodIndex}`,
+      'COUPON_DISTRIBUTED',
+      id,
+      {
+        periodIndex: dto.periodIndex,
+        reportId: dto.reportId,
+        holderAddresses,
+        totalCredits: toBigIntString(parsed?.[2] ?? 0),
+        transactionHash,
+      },
+    );
     return {
       bondId: id,
       periodIndex: dto.periodIndex,
@@ -372,6 +514,7 @@ export class BondsService {
       holderCount: Number(parsed?.[3] ?? 0),
     };
   }
+
 
   async claimCredits(id: number, dto: ClaimCreditsDto): Promise<ClaimCreditsResponse> {
     const investorSecret = this.signingKeys.investorSecret();
@@ -483,8 +626,6 @@ export class BondsService {
       try {
         const scVal = await this.contractService.simulateCall({
           contractAddress: this.configService.getCouponEngineAddress(),
-          method: 'get_claimable_credits',
-          args: [Address.fromString(address).toScVal(), nativeToScVal(BigInt(bond.id), { type: 'u64' })],
           method: 'claimable_credits',
           args: [nativeToScVal(BigInt(bond.id), { type: 'u64' }), Address.fromString(address).toScVal()],
         });
@@ -517,32 +658,37 @@ export class BondsService {
     const scVal = await this.contractService.simulateCall({
       contractAddress: this.configService.getCouponEngineAddress(),
       method: 'claimable_credit_details',
-      args: [nativeToScVal(BigInt(id), { type: 'u64' }), Address.fromString(address).toScVal()],
+      args: [nativeToScVal(BigInt(bondId), { type: 'u64' }), Address.fromString(address).toScVal()],
     });
 
     const nativeResult = scValToNative(scVal) as any[];
     if (!nativeResult || !nativeResult.length) {
-      return { bondId: id, address, total: '0', details: [] };
+      return { bondId, address, total: '0', details: [] };
     }
 
     let total = 0n;
     const details = [];
 
     for (const item of nativeResult) {
-      const amount = BigInt(item[5]);
+      const periodIndex = Number(item.period_index ?? item[0] ?? 0);
+      const reportId = Number(item.report_id ?? item[1] ?? 0);
+      const startTime = Number(item.start_time ?? item[2] ?? 0);
+      const endTime = Number(item.end_time ?? item[3] ?? 0);
+      const creditType = String(item.credit_type ?? item[4] ?? '');
+      const amount = BigInt(item.amount ?? item[5] ?? 0);
       details.push({
-        periodIndex: Number(item[0]),
-        reportId: Number(item[1]),
-        startTime: Number(item[2]),
-        endTime: Number(item[3]),
-        creditType: String(item[4]),
+        periodIndex,
+        reportId,
+        startTime,
+        endTime,
+        creditType,
         amount: amount.toString(),
       });
       total += amount;
     }
 
     return {
-      bondId: id,
+      bondId,
       address,
       total: total.toString(),
       details,

@@ -75,3 +75,12 @@ wallets do not sign admin intents.
 - Wrong target → `401`
 - Invalid signature → `401`
 - Replayed nonce → `409 Conflict`
+
+## Intent receipts
+
+Every intent decision on these endpoints also produces a signed receipt
+(`rejected`, `authorized` → `succeeded` / `failed`), returned as the
+`x-intent-receipt-id` response header and reviewable under
+`/admin/intent-receipts`. Look up the receipt before retrying an action whose
+response you did not receive. See
+[maintainer-intent-receipts.md](maintainer-intent-receipts.md).

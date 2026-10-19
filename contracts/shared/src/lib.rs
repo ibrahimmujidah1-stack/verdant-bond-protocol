@@ -1,8 +1,21 @@
 #![no_std]
 mod errors;
 mod types;
+mod coupon_pause;
+mod jurisdiction_versioning;
+mod settlement_reconciliation;
+mod methodology_snapshot;
+mod liability_reserve_alert;
 pub use errors::*;
 pub use types::*;
+pub use coupon_pause::*;
+pub use jurisdiction_versioning::*;
+pub use settlement_reconciliation::*;
+pub use methodology_snapshot::*;
+pub use liability_reserve_alert::*;
+
+#[cfg(test)]
+mod tests;
 
 /// Issue #188 — versioned-interface convention for the contract suite.
 ///

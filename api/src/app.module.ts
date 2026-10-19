@@ -17,7 +17,9 @@ import { RateLimitGuard } from './common/guards/rate-limit.guard';
 import { AuditInterceptor } from './common/interceptors/audit.interceptor';
 import { IdempotencyInterceptor } from './common/interceptors/idempotency.interceptor';
 import { OpsModule } from './ops/ops.module';
+import { PolicyModule } from './policy/policy.module';
 import { LedgerModule } from './ledger/ledger.module';
+import { ImportsModule } from './imports/imports.module';
 
 @Module({
   imports: [
@@ -48,6 +50,8 @@ import { LedgerModule } from './ledger/ledger.module';
     FeesModule,
     AuthorizationsModule,
     StatusModule,
+    PolicyModule,
+    ImportsModule,
   ],
   providers: [
     { provide: APP_FILTER, useClass: Rfc7807ExceptionFilter },

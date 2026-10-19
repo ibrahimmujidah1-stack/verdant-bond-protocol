@@ -42,6 +42,7 @@ export const ENV_UNIQUE_VARS = [
   'IPFS_SECRET_KEY',
   'KYC_API_KEY',
   'AUDIT_EVIDENCE_PEPPER',
+  'INTENT_RECEIPT_SIGNING_SECRET',
   'DATABASE_URL',
   ...CONTRACT_ID_VARS,
 ] as const;
@@ -187,6 +188,20 @@ export function checkConfigContract(env: EnvMap, target: DeployTarget): Contract
     const other = seenSigners.get(value);
     if (other && target !== 'development') fail(name, 'SHARED_SIGNER', `${name} reuses the key of ${other}`);
     else seenSigners.set(value, name);
+  }
+  // Intent receipt signer (optional; ephemeral key when unset): a distinct
+  // identity, so a receipt can never be mistaken for an operator signature.
+  const receiptSecret = env.INTENT_RECEIPT_SIGNING_SECRET;
+  if (present(receiptSecret)) {
+    if (!StrKey.isValidEd25519SecretSeed(receiptSecret)) {
+      fail('INTENT_RECEIPT_SIGNING_SECRET', 'INVALID_SECRET_SEED', 'INTENT_RECEIPT_SIGNING_SECRET is not a Stellar secret seed (S…)');
+    } else if (seenSigners.has(receiptSecret) && target !== 'development') {
+      fail(
+        'INTENT_RECEIPT_SIGNING_SECRET',
+        'SHARED_SIGNER',
+        `INTENT_RECEIPT_SIGNING_SECRET reuses the key of ${seenSigners.get(receiptSecret)}`,
+      );
+    }
   }
   if (present(env.STELLAR_PUBLIC_KEY) && present(env.ADMIN_SECRET_KEY) && StrKey.isValidEd25519SecretSeed(env.ADMIN_SECRET_KEY)) {
     if (Keypair.fromSecret(env.ADMIN_SECRET_KEY).publicKey() !== env.STELLAR_PUBLIC_KEY) {
